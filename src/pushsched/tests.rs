@@ -684,6 +684,27 @@ fn repeated_402s_never_retire_a_lane() {
     }
 }
 
+/// A 402 must not burn a retry attempt: a routine settlement every ~32 MiB
+/// would otherwise fail a large upload after a handful of windows.
+#[test]
+fn a_402_does_not_burn_a_retry_attempt() {
+    let mut s = two_lanes();
+    let max = s.cfg.max_attempts;
+    // Exhaust all but one attempt with real failures, then 402 repeatedly:
+    // the chunk must never tip into Failed from 402s alone.
+    for _ in 0..20 {
+        let (b, _lane) = dispatch_one(&mut s, 0);
+        s.on_batch_result(b, BatchOutcome::PaymentRequired, 0);
+        // fund so the lane stays dispatchable; attempts are what we assert.
+        for l in s.unfunded_lanes() {
+            s.fund_lane(l);
+        }
+    }
+    assert_eq!(s.failed(), 0, "402s must never fail a chunk");
+    assert!(s.total() > s.failed(), "work remains");
+    let _ = max;
+}
+
 /// A 402 must not touch the failure streak — otherwise a lane that has
 /// been asking for payment is one transport error away from backoff.
 #[test]

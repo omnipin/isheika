@@ -171,6 +171,15 @@ impl PaymentQuote {
                 .map(u128::from)
                 .ok_or(QuoteError::Field("credit_ratio"))?,
         };
+        // `quote_valid_secs` (§7.2/§11.9): how long this quote may be
+        // cached. Optional for backward compat with pre-Stage-1 relays;
+        // when present it must be a positive number of seconds.
+        if let Some(v) = payment.get("quote_valid_secs") {
+            let secs = v.as_u64().ok_or(QuoteError::Field("quote_valid_secs"))?;
+            if secs == 0 {
+                return Err(QuoteError::Field("quote_valid_secs"));
+            }
+        }
         // A lane whose parameters violate §10.1's invariant would brick this
         // client, so refuse it here rather than discovering it at the first
         // 402 with no cheque able to clear it.
@@ -332,6 +341,16 @@ impl LaneAccount {
     pub fn with_cumulative(mut self, cumulative_plur: u128) -> Self {
         self.cumulative_plur = cumulative_plur;
         self
+    }
+
+    /// Advance the cumulative to a larger value observed in the shared
+    /// store (another lane sharing this beneficiary settled first).
+    /// Monotonic-only: never moves backwards, so it cannot produce a
+    /// non-increasing cheque.
+    pub fn set_cumulative_to(&mut self, cumulative_plur: u128) {
+        if cumulative_plur > self.cumulative_plur {
+            self.cumulative_plur = cumulative_plur;
+        }
     }
 
     pub fn owed(&self) -> u128 {
@@ -510,42 +529,12 @@ impl LaneAccount {
     }
 }
 
-/// Aggregate exposure across every beneficiary drawn on one chequebook.
-///
-/// Cumulative payouts are per `(chequebook, beneficiary)`, so N lanes are N
-/// independent claims on **one** balance. Without this a cheque to the
-/// second lane silently exceeds it and bounces — and §11.3's Sybil case is
-/// exactly one operator presenting several beneficiaries.
-#[derive(Debug, Default, Clone)]
-pub struct TotalIssued {
-    per_beneficiary: std::collections::BTreeMap<[u8; 20], u128>,
-}
-
-impl TotalIssued {
-    pub fn total(&self) -> u128 {
-        self.per_beneficiary.values().copied().sum()
-    }
-
-    pub fn issued_to(&self, beneficiary: &[u8; 20]) -> u128 {
-        self.per_beneficiary.get(beneficiary).copied().unwrap_or(0)
-    }
-
-    /// Would raising this beneficiary's cumulative to `cumulative` push the
-    /// total past the chequebook's balance?
-    pub fn would_exceed(&self, beneficiary: &[u8; 20], cumulative: u128, balance: u128) -> bool {
-        let others = self.total() - self.issued_to(beneficiary);
-        others.saturating_add(cumulative) > balance
-    }
-
-    pub fn record(&mut self, beneficiary: [u8; 20], cumulative: u128) {
-        let e = self.per_beneficiary.entry(beneficiary).or_insert(0);
-        // Cumulatives only grow; a lower value is a stale report, not a
-        // refund.
-        if cumulative > *e {
-            *e = cumulative;
-        }
-    }
-}
+// Aggregate exposure across beneficiaries lives in exactly one place:
+// `crate::cheques::ChequeStore::{total_issued, would_exceed_balance,
+// set_cumulative}` (§8.3, mirroring bee's `reserveTotalIssued`). An earlier
+// cut kept a second copy here (`TotalIssued`); it drifted (`sum()` vs
+// `saturating_add`) while the store was the one `pay()` actually gated on,
+// so the duplicate was removed rather than kept in step.
 
 // ──────────────────────────────────────────────────────────────────────
 // The payment loop (docs/pusher-incentives.md §12)
@@ -570,6 +559,13 @@ pub struct PaymentConfig {
     /// would be accepted and then fail at cashout, which looks like the
     /// relay's fault and costs the lane's trust rather than ours.
     pub balance_plur: u128,
+    /// Pinned identities per lane URL (§2). A lane whose quote is signed by
+    /// an unknown key or names an unknown beneficiary is refused rather than
+    /// paid — otherwise any host answering the URL could mint its own quote
+    /// and be paid. Empty means TOFU-with-warning (first-seen identity is
+    /// trusted for this run but logged); callers with stable fleets should
+    /// pass `--lane-pin` entries.
+    pub pins: std::collections::HashMap<String, LanePin>,
 }
 
 /// Per-lane payment state: the verified quote, a cached capability, and the
@@ -611,6 +607,38 @@ impl LanePayer {
         self.cap_plur = cap;
     }
 
+    /// Drop the cached capability so the next `header()` refetches. A 401
+    /// (expired/invalid challenge, wrong origin/account/batch) means the
+    /// cached header is stale — retrying it until expiry only burns lane
+    /// health.
+    pub fn clear_header(&mut self) {
+        self.header = None;
+        self.header_stale_after = 0;
+    }
+
+    /// Re-read the shared cumulative store and adopt it if another lane
+    /// sharing this beneficiary settled first. Lanes behind one beneficiary
+    /// are one settlement channel (§8.3): computing `next_cumulative` from
+    /// a stale snapshot re-issues a cumulative the relay rejects as
+    /// non-increasing, or — worse — records a lower cumulative *after* the
+    /// relay accepted and jams settlement.
+    pub fn sync_cumulative(&mut self, cfg: &PaymentConfig) {
+        let key = crate::cheques::relay_key(&self.quote.beneficiary);
+        let stored = cfg
+            .cheques
+            .lock()
+            .expect("cheque store poisoned")
+            .cumulative(&key);
+        self.account.set_cumulative_to(stored);
+    }
+
+    /// Whether the credit line is known yet. `cap == 0` means no challenge
+    /// has been fetched — sizing must be skipped (keep the relay's
+    /// advertised ceiling), not raised to `MAX`.
+    pub fn cap_known(&self) -> bool {
+        self.cap_plur != 0
+    }
+
     /// A valid challenge header, fetching and signing one if needed.
     ///
     /// Re-fetched 30 s before expiry rather than on failure: racing the
@@ -621,6 +649,14 @@ impl LanePayer {
         http: &reqwest::Client,
         cfg: &PaymentConfig,
     ) -> Result<&str, String> {
+        // The relay chooses the chain in its quote; the client must not sign
+        // for a different one. `--chequebook-chain-id` is the guard.
+        if self.quote.chain_id != cfg.chain_id {
+            return Err(format!(
+                "lane {} quotes chain {} but this client pays on chain {}",
+                self.base_url, self.quote.chain_id, cfg.chain_id
+            ));
+        }
         let now = crate::challenge::now_unix();
         if self.header.is_none() || now >= self.header_stale_after {
             let account = *cfg.signer.eth_address();
@@ -654,14 +690,6 @@ impl LanePayer {
             self.header = Some(offered.sign(&cfg.signer, self.quote.chain_id)?);
         }
         Ok(self.header.as_deref().unwrap_or_default())
-    }
-
-    /// Largest POST body this lane will currently admit.
-    pub fn max_body_bytes(&self) -> u64 {
-        if self.cap_plur == 0 {
-            return u64::MAX;
-        }
-        self.account.max_body_bytes(self.cap_plur)
     }
 
     /// Frames per POST this lane can ever afford, ignoring current debt.
@@ -874,6 +902,10 @@ impl LanePayer {
         http: &reqwest::Client,
         cfg: &PaymentConfig,
     ) -> Result<Option<u128>, String> {
+        // Another lane sharing this beneficiary may have settled first:
+        // re-read the shared store so `next_cumulative` continues from the
+        // true high-water mark, not a stale snapshot.
+        self.sync_cumulative(cfg);
         let Some(cumulative) = self.account.next_cumulative() else {
             return Ok(None);
         };
@@ -892,6 +924,12 @@ impl LanePayer {
         cumulative: u128,
         correct_once: bool,
     ) -> Result<Option<u128>, String> {
+        if self.quote.chain_id != cfg.chain_id {
+            return Err(format!(
+                "lane {} quotes chain {} but this client pays on chain {}",
+                self.base_url, self.quote.chain_id, cfg.chain_id
+            ));
+        }
         // Aggregate exposure across every beneficiary drawn on this one
         // chequebook (§8.3): the second lane's cheque is what silently
         // bounces without this.
@@ -915,7 +953,7 @@ impl LanePayer {
                 self.quote.chain_id,
             )
             .map_err(|e| format!("sign cheque: {e}"))?;
-        let body = crate::protocols::swap::encode_signed_cheque_json_pub(
+        let body = crate::protocols::swap::encode_signed_cheque_json(
             &cfg.chequebook,
             &self.quote.beneficiary,
             alloy_primitives::U256::from(cumulative),
@@ -963,8 +1001,21 @@ impl LanePayer {
         // Record the cumulative *before* trusting the reply: we have
         // certainly issued it, and under-recording is what causes the next
         // cheque to be rejected as non-increasing.
+        //
+        // Re-check the aggregate balance under the same lock that records:
+        // the pre-sign check races a concurrent lane settling on the same
+        // chequebook (both pass, sum exceeds balance, second bounces at
+        // cashout). The second gate turns the race into a legible error
+        // before the cheque is counted locally.
         {
             let mut store = cfg.cheques.lock().expect("cheque store poisoned");
+            if store.would_exceed_balance(&key, cumulative, cfg.balance_plur) {
+                return Err(format!(
+                    "cheque for {cumulative} would push total issuance past the chequebook's \
+                     {} balance across all lanes",
+                    cfg.balance_plur
+                ));
+            }
             store
                 .set_cumulative(&key, cumulative)
                 .map_err(|e| format!("cheque store: {e}"))?;
@@ -1007,6 +1058,7 @@ mod tests {
             "max_outstanding_plur": p.max_outstanding_plur.to_string(),
             "credit_ratio": p.credit_ratio as u64,
             "challenge_ttl_secs": 300,
+            "quote_valid_secs": 86400,
         });
         let sig = n.sign_eip191(body.to_string().as_bytes()).expect("sign");
         body["sig"] = serde_json::Value::String(format!("0x{}", hex::encode(sig)));
@@ -1552,27 +1604,8 @@ mod tests {
         assert_eq!(a.owed(), owed + 1);
     }
 
-    /// N lanes are N claims on one balance. The client must see the sum, or
-    /// the second cheque bounces.
-    #[test]
-    fn total_issued_aggregates_across_beneficiaries() {
-        let mut t = TotalIssued::default();
-        t.record([1u8; 20], 600);
-        t.record([2u8; 20], 300);
-        assert_eq!(t.total(), 900);
-        assert!(!t.would_exceed(&[1u8; 20], 700, 1000), "700 + 300 fits");
-        assert!(t.would_exceed(&[1u8; 20], 800, 1000), "800 + 300 does not");
-        assert!(
-            !t.would_exceed(&[3u8; 20], 100, 1000),
-            "a new beneficiary is checked against the others' total"
-        );
-    }
-
-    #[test]
-    fn a_stale_cumulative_report_never_lowers_the_total() {
-        let mut t = TotalIssued::default();
-        t.record([1u8; 20], 600);
-        t.record([1u8; 20], 100);
-        assert_eq!(t.total(), 600, "cumulatives only grow");
-    }
+    // N-lanes-one-balance aggregation is covered where it lives:
+    // `cheques::metered_tests::{total_issued_sums_every_payee,
+    // over_committing_the_balance_is_caught_before_signing,
+    // a_cumulative_never_moves_backwards}`.
 }

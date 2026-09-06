@@ -34,14 +34,14 @@ header: 'Paying for relay — an incentive layer for hoverfly pushers'
 
 # Unpaid relay bandwidth
 
-Upload directly and bee debits your own node for every chunk. Put a relay in the middle and that debt moves to it — the relay is the peer bee sees. Pseudosettle pays it in time rather than money, so what a relay actually spends is bandwidth, and nothing prices that.
+Upload directly and bee debits your own node for every chunk. Put a relay in the middle and that debt moves to it — the relay is the peer bee sees. The debt is real (pseudosettle pays it in time rather than money), so what a relay actually spends is bandwidth, and nothing prices that.
 
-|  | free | paid |
+|  | open | metered |
 |---|---|---|
 | client → relay | nothing | 4.8e8 PLUR per KiB |
 | relay → bee | time, not money | unchanged |
 
-> A free tier hands a relay 70–100 GB of egress a month. Burn all of it under metering and it bills **$0.35–0.51**.
+> A free tier allows a relay 70–100 GB of egress a month (a ceiling, not consumption). Burn all of it under metering and it bills **$0.35–0.51**.
 
 ---
 
@@ -60,10 +60,10 @@ A relay is a standalone HTTP service — no registry, no list to get onto. Trust
 # The billing unit
 
 ```
-owed = KiB the relay accepted × price per KiB
+owed = (KiB admitted − KiB served from cache) × price per KiB
 ```
 
-> The client cannot lie about it. It produced the bytes; the relay counted them.
+> The client cannot lie about it. It produced the bytes; the relay counted them. Dedup hits (§8.2) bill at zero.
 
 Bytes admitted, not delivery receipts. Billing per receipt meant trusting a **third party's signature**, which took five mechanisms to make safe. Changing the unit removed all five.
 
@@ -104,7 +104,7 @@ A cheque is a running total: "you have now paid me *this much in total*".
 
 - **Losing one costs nothing** — the next covers it
 - **Old ones are worthless** — each must exceed the last
-- **Gas is paid once per customer**, not per cheque
+- **Gas is paid once per account** (one cumulative per chequebook), not per cheque
 
 <!-- hazard -->
 > Money set aside for an upload in progress must never be written to disk. No upload survives a restart, so nothing would ever release it.
@@ -115,7 +115,7 @@ A cheque is a running total: "you have now paid me *this much in total*".
 
 # Unit economics
 
-Relaying earns **$0.02 per GiB** admitted. On a host you already pay for, the only cost is cashout gas — 110k gas, a ten-billionth of a dollar.
+Relaying earns **$0.02 per GiB** admitted (at $0.40/BZZ). On a host you already pay for, cashout gas is negligible — the two real cashouts used 75k/110k gas at ~1e-10 xDAI (assumes xDAI≈$1; Gnosis gas varies ~8× observed).
 
 | | per month |
 |---|---:|
@@ -134,11 +134,11 @@ Paying is optional, and each relay sets its own mode.
 
 | Relay | Client can pay | Client cannot |
 |---|---|---|
-| free | nothing billed | nothing billed |
-| paid, soft | billed, settles | billed, served anyway |
-| paid, enforced | billed, settles | **dropped at startup** |
+| open | nothing billed | nothing billed |
+| metered, soft | billed, settles | billed, served anyway |
+| metered, hard | billed, settles | **dropped at startup** |
 
-> Four free relays run on hosts that wipe their disk on restart — and a relay that forgets what it is owed serves for free forever. The browser app skips the paid one: it can sign chunks, not cheques.
+> Four open relays run on ephemeral free-tier hosts (disk wiped on restart) — and a relay that forgets what it is owed serves for free forever, which is why §5 requires durable state for metering. The browser app skips hard lanes: it can sign chunks, not cheques.
 
 ---
 
@@ -149,11 +149,11 @@ Paying is optional, and each relay sets its own mode.
 | § | Bug |
 |---|---|
 | 17.1 | Carried-over debt could not be paid |
-| 17.2 | Headroom measured one chunk, then sent a batch |
+| 17.2 | Headroom admitted a frame, then sent a batch |
 | 17.3 | A rule checked against the wrong number |
-| 17.4 | A lane refused for bytes in flight was parked forever |
+| 17.4 | A client refused for bytes in flight parked the lane forever |
 | 17.5 | One broken stream bounced every later cheque |
-| 17.6 | The first upload was sized before the debt was known |
+| 17.6 | The first POST was sized before the debt was known |
 
 > No test suite reached any of them, and none is reachable from one upload against a fresh relay. Between them they needed debt surviving restarts, several POSTs in flight, and a batch spent down far enough to bind.
 
@@ -163,9 +163,9 @@ Paying is optional, and each relay sets its own mode.
 
 # Results
 
-Three runs of 2 MiB, 567/567 chunks delivered, no refusals, no rejected cheques, each settling to zero owed. Cheques cash from a separate machine — the relay must never hold that key.
+Steady state over public HTTPS (post-§17 fixes): three runs of 2 MiB, 567/567 each, 0 refusals, 0 rejected cheques, each settling to zero. Earlier sizes still show intended 402s as the recovery path (1 MiB: 2, 2 MiB: 2, 4 MiB: 4 — see §17). Cheques cash from a separate machine — the relay must never hold that key.
 
-| | to date |
+| | to date (relay `owed_usd` + two `cashChequeBeneficiary` transfers) |
 |---|---:|
 | billed | $0.0003 |
 | cashed on-chain | $0.00006 |

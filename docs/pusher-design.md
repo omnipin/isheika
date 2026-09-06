@@ -662,7 +662,7 @@ worked without it:
 ## 12. Incentives — paying for relay
 
 Specified separately in **[`pusher-incentives.md`](./pusher-incentives.md)**
-(status: design only, nothing implemented).
+(status: Stages 0–2 shipped — soft + hard enforcement + cashout).
 
 The problem it addresses: a relay absorbs a cost it did not incur. In a
 native upload the user's own machine is the peer bee debits for every
@@ -681,13 +681,18 @@ batch-owner EOA already established by push auth, and the relay holds only
 the beneficiary *address* — never a spendable key.
 
 **The trust model is one-directional, and it drives everything else.**
-Relays are a curated set pinned by URL (`PUSHER_URLS`,
-`apps/upload/src/config.ts:18-25`); clients are anonymous. So the design
-protects the *relay* from the *client*, and a misbehaving lane is handled
-socially — removed from the list — rather than cryptographically. An
-earlier revision built two-sided verification for this one-sided
-relationship and paid for it with a forgeable billing unit and an
-unbounded residual; see incentives §2.
+The asymmetry is **pinning, not curation** (incentives §2): a relay is a
+plain HTTP service anyone can run — there is no registry, no discovery, no
+federation roster, and `PUSHER_URLS` is one client's default fleet, not a
+membership list. A client verifies the signed quote and pins
+`(url, node_eth_address, beneficiary)` before sending a byte (or
+TOFU-trusts first-seen with a warning via `--lane-pin`); a relay gets
+whoever POSTs. So the design protects the *relay* from the *client*, and a
+client is protected by its self-computed bill, pinned price, capped
+exposure (`max_outstanding`), and measured outcomes — not by removing a
+lane from a list. An earlier revision built two-sided verification for
+this one-sided relationship and paid for it with a forgeable billing unit
+and an unbounded residual; see incentives §2.
 
 Findings from that doc that constrain this one:
 

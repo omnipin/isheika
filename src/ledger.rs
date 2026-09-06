@@ -48,6 +48,8 @@ pub enum LedgerError {
     Absurd(u128),
     #[error("cheque credits {got} but only {owed} is owed")]
     Overpayment { got: u128, owed: u128 },
+    #[error("ledger persist failed: {0}")]
+    Store(String),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -167,6 +169,15 @@ impl Ledger {
             Err(e) => return Err(StoreError::Io(e.to_string())),
         };
         let disk: OnDisk = serde_json::from_str(&text)?;
+        // Version dispatch: v1 entries load (missing sig → zeroed, skipped at
+        // cashout) but an unknown future version must not load silently with
+        // changed semantics.
+        if disk.version != 1 && disk.version != 2 {
+            return Err(StoreError::Io(format!(
+                "unsupported ledger version {}",
+                disk.version
+            )));
+        }
         let mut secret = [0u8; 32];
         let raw = hex::decode(disk.secret_hex.trim_start_matches("0x"))
             .map_err(|e| StoreError::Io(format!("secret hex: {e}")))?;
@@ -294,6 +305,45 @@ impl Ledger {
             .and_then(|a| a.last_cumulative.get(chequebook))
             .map(|c| c.cumulative_plur)
             .unwrap_or(0)
+    }
+
+    pub fn held_cheque(&self, account: &[u8; 20], chequebook: &[u8; 20]) -> Option<HeldCheque> {
+        self.accounts
+            .get(account)
+            .and_then(|a| a.last_cumulative.get(chequebook))
+            .copied()
+    }
+
+    pub fn had_binding(&self, chequebook: &[u8; 20]) -> bool {
+        self.binding.contains_key(chequebook)
+    }
+
+    /// Undo a `credit` whose persist failed, restoring owed + cumulative +
+    /// binding to their pre-credit values so disk and memory agree (both
+    /// old). Keeps the relay fail-closed: the client re-presents the same
+    /// cheque and it credits once the disk is writable again.
+    pub fn rollback_credit(
+        &mut self,
+        account: [u8; 20],
+        chequebook: [u8; 20],
+        prev_owed: u128,
+        prev_held: Option<HeldCheque>,
+        had_binding: bool,
+    ) {
+        if let Some(a) = self.accounts.get_mut(&account) {
+            a.owed_plur = prev_owed;
+            match prev_held {
+                Some(h) => {
+                    a.last_cumulative.insert(chequebook, h);
+                }
+                None => {
+                    a.last_cumulative.remove(&chequebook);
+                }
+            }
+        }
+        if !had_binding {
+            self.binding.remove(&chequebook);
+        }
     }
 
     /// Every cheque the relay holds, newest per chequebook. This is what

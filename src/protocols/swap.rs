@@ -81,7 +81,7 @@ pub struct SettlementRates {
 /// `Address.MarshalJSON` quotes the hex (with 0x prefix); `[]byte`
 /// (the Signature field) is JSON-encoded as base64 standard encoding
 /// by `encoding/json`.
-fn encode_signed_cheque_json(
+pub fn encode_signed_cheque_json(
     chequebook: &[u8; 20],
     beneficiary: &[u8; 20],
     cumulative_payout: U256,
@@ -103,18 +103,6 @@ fn encode_signed_cheque_json(
          \"CumulativePayout\":{cumulative},\"Signature\":\"{sig_b64}\"}}"
     )
     .into_bytes()
-}
-
-/// Public wrapper: the client needs to produce this body for a metered
-/// relay's `POST /v1/pay`, and it must be byte-identical to what bee's
-/// `json.Marshal` emits (see the encoder's own note on `*big.Int`).
-pub fn encode_signed_cheque_json_pub(
-    chequebook: &[u8; 20],
-    beneficiary: &[u8; 20],
-    cumulative_payout: U256,
-    signature: &[u8; 65],
-) -> Vec<u8> {
-    encode_signed_cheque_json(chequebook, beneficiary, cumulative_payout, signature)
 }
 
 /// Outbound `Handshake { Beneficiary }`. Called once per session by
@@ -322,6 +310,15 @@ fn extract_cumulative(bytes: &[u8]) -> Result<U256, SwapError> {
     }
     let digits = std::str::from_utf8(&bytes[start..i])
         .map_err(|e| SwapError::Json(format!("CumulativePayout utf8: {e}")))?;
+    // `123e5` / `123.45` are valid JSON numbers but not bare integers: the
+    // scan above stops at the first non-digit, so require a value terminator
+    // to avoid crediting a prefix of what a JSON auditor reads.
+    if i < bytes.len() && !(bytes[i] == b',' || bytes[i] == b'}' || bytes[i].is_ascii_whitespace())
+    {
+        return Err(SwapError::Json(
+            "CumulativePayout must be a bare JSON integer, as Go emits it".into(),
+        ));
+    }
     U256::from_str_radix(digits, 10)
         .map_err(|e| SwapError::Json(format!("CumulativePayout overflows u256: {e}")))
 }
@@ -407,6 +404,19 @@ mod cheque_decode_tests {
         let body = encode_signed_cheque_json(&[0x11; 20], &[0x22; 20], U256::from(5u64), &bad);
         let e = decode_signed_cheque_json(&body).expect_err("uncashable cheque");
         assert!(format!("{e}").contains("non-canonical"), "got: {e}");
+    }
+
+    #[test]
+    fn a_scientific_or_fractional_payout_is_rejected_not_truncated() {
+        // `123e5` / `123.45` are valid JSON but not bare integers: the scan
+        // must not credit the `123` prefix.
+        for body in [
+            br#"{"Chequebook":"0x1111111111111111111111111111111111111111","Beneficiary":"0x2222222222222222222222222222222222222222","CumulativePayout":123e5,"Signature":"AQ=="}"#.as_slice(),
+            br#"{"Chequebook":"0x1111111111111111111111111111111111111111","Beneficiary":"0x2222222222222222222222222222222222222222","CumulativePayout":123.45,"Signature":"AQ=="}"#.as_slice(),
+        ] {
+            let e = decode_signed_cheque_json(body).expect_err("must reject non-bare integer");
+            assert!(format!("{e}").contains("bare JSON integer"), "got: {e}");
+        }
     }
 
     #[test]

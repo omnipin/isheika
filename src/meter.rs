@@ -733,11 +733,15 @@ impl Params {
     /// Settling at half the line leaves the other half as the working
     /// headroom a POST is dispatched into.
     pub fn effective(&self, cap: u128) -> EffectiveParams {
-        let settle_every = self.settle_every_plur.min(cap / 2);
+        // Floor at 1: for a degenerate line (cap < 2) `cap / 2` is 0, which
+        // would make every cheque acceptable including 0-value ones — dust
+        // protection off exactly when the batch is most worthless. The
+        // account can still exit (settle_every=1 is immediately crossed).
+        let settle_every = self.settle_every_plur.min(cap / 2).max(1);
         EffectiveParams {
             // Preserves `min_cheque <= settle_every` — the half of §10.1
             // that makes a 402 clearable — at any credit line.
-            min_cheque_plur: self.min_cheque_plur.min(settle_every),
+            min_cheque_plur: self.min_cheque_plur.min(settle_every).max(1),
             settle_every_plur: settle_every,
         }
     }

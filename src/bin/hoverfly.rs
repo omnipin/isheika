@@ -140,8 +140,17 @@ struct Cli {
     /// for Sepolia testnet. The chain id is part of the domain
     /// separator that bee's chequestore verifies against, so a
     /// mismatch silently invalidates every cheque we send.
+    /// Metered lanes are also checked against this: a quote naming a
+    /// different chain is refused rather than signed for.
     #[arg(long, global = true, default_value_t = 100, value_name = "ID")]
     chequebook_chain_id: u64,
+
+    /// Pin a metered lane's identity: `URL,NODE,BENEFICIARY` (0x-hex).
+    /// Repeatable. Without a pin the first-seen quote is trusted for the
+    /// run (TOFU) with a warning — any host answering the URL could mint
+    /// its own quote and be paid. Stable fleets should pin.
+    #[arg(long, global = true, value_name = "URL,NODE,BENEFICIARY")]
+    lane_pin: Vec<String>,
 
     /// Path to the 32-byte overlay nonce file. The Swarm overlay is
     /// derived as `keccak256(eth_addr || network_id || nonce)`, so a
@@ -809,15 +818,19 @@ enum Commands {
     /// the relay**: `cashChequeBeneficiary` must be sent *by* the
     /// beneficiary, so it needs the beneficiary's private key — which is
     /// exactly the key a relay box is designed never to hold. Copy the
-    /// ledger file (or point `--state-dir` at a snapshot of it) and run
-    /// this from a machine that does.
+    /// relay's state directory (it contains `ledger.json`), or point
+    /// `--state-dir` at a snapshot copy of that directory, and run this
+    /// from a machine that does.
     ///
     /// A cheque is cumulative, so only the newest one per chequebook is
     /// ever presented; gas is paid once per chequebook, not once per
     /// cheque received.
     ///
     /// Behind the `pusher` feature because it reads the *relay's* ledger:
-    /// without a relay there are no cheques to cash.
+    /// without a relay there are no cheques to cash. (Ideally this would
+    /// be `#[cfg(unix)]` with only `ledger` ungated — a cashout box needs
+    /// no hyper server — but `ledger` currently shares the `pusher` gate,
+    /// so cashing requires it for now.)
     #[cfg(all(unix, feature = "pusher"))]
     Cashout {
         #[arg(
@@ -836,9 +849,11 @@ enum Commands {
         /// Where the BZZ should land. Defaults to the beneficiary.
         #[arg(long, value_name = "ADDR")]
         recipient: Option<String>,
-        /// Skip cheques worth less than this in BZZ. Cashing costs ~300k
-        /// gas whatever the amount, so tiny cheques are worth less than
-        /// collecting them (§9.3).
+        /// Skip cheques worth less than this in BZZ. Measured cashouts use
+        /// ~75-110k gas at ~1e-10 xDAI, so any non-zero cheque repays its
+        /// gas; this threshold is a batching convenience — how much value
+        /// to let accumulate before spending an RPC round trip and a
+        /// pending transaction — not a break-even (§9.3).
         #[arg(long, default_value = "0.25", value_name = "BZZ")]
         min_amount: String,
         /// Only one chequebook, rather than everything in the ledger.
@@ -966,7 +981,6 @@ enum Commands {
 
 #[cfg(unix)]
 #[derive(Subcommand)]
-#[cfg(unix)]
 enum ChequebookAction {
     /// Deploy a chequebook through bee's canonical SimpleSwapFactory.
     ///
@@ -1358,6 +1372,37 @@ fn parse_address_hex(s: &str) -> Result<[u8; 20], String> {
     let bytes = hex::decode(trimmed).map_err(|e| format!("bad hex: {e}"))?;
     let mut out = [0u8; 20];
     out.copy_from_slice(&bytes);
+    Ok(out)
+}
+
+/// Parse `--lane-pin URL,NODE,BENEFICIARY` entries into URL → pin.
+fn parse_lane_pins(
+    raw: &[String],
+) -> Result<std::collections::HashMap<String, hoverfly::payer::LanePin>, String> {
+    let mut out = std::collections::HashMap::new();
+    for entry in raw {
+        let parts: Vec<&str> = entry.split(',').collect();
+        if parts.len() != 3 {
+            return Err(format!(
+                "--lane-pin must be URL,NODE,BENEFICIARY (0x-hex), got {entry:?}"
+            ));
+        }
+        let url = parts[0].trim().trim_end_matches('/').to_string();
+        if url.is_empty() {
+            return Err(format!("--lane-pin has empty URL in {entry:?}"));
+        }
+        let node =
+            parse_address_hex(parts[1].trim()).map_err(|e| format!("--lane-pin node: {e}"))?;
+        let beneficiary = parse_address_hex(parts[2].trim())
+            .map_err(|e| format!("--lane-pin beneficiary: {e}"))?;
+        out.insert(
+            url,
+            hoverfly::payer::LanePin {
+                node_eth_address: node,
+                beneficiary,
+            },
+        );
+    }
     Ok(out)
 }
 
@@ -1991,26 +2036,62 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Some(cb_hex) => {
                         let cb =
                             parse_address_hex(cb_hex).map_err(|e| format!("--chequebook: {e}"))?;
+                        let pins = parse_lane_pins(&cli.lane_pin)?;
                         // The relay checks funding against `liquidBalanceFor`
                         // at accept time; we check total issuance against the
-                        // same balance before signing, so we never hand over a
-                        // cheque that cannot be cashed.
-                        let st = hoverfly::batch::read_chequebook_state(
-                            &rpc_url,
-                            alloy_primitives::Address::from(cb),
-                            alloy_primitives::Address::ZERO,
-                        )
-                        .await?;
+                        // total liquid before signing, so we never hand over a
+                        // cheque that cannot be cashed. Read with ZERO
+                        // beneficiary: `liquidBalanceFor(0x0)` is the total
+                        // liquid (no hard deposit for zero), i.e. the global
+                        // ceiling across all lanes — not any lane's figure.
+                        // `issuer` is beneficiary-independent, so this also
+                        // fail-fasts a chequebook/sign-key mismatch that would
+                        // otherwise surface mid-upload as 403/400 after
+                        // stamping.
+                        let (balance_plur, issuer_ok) =
+                            match hoverfly::batch::read_chequebook_state(
+                                &rpc_url,
+                                alloy_primitives::Address::from(cb),
+                                alloy_primitives::Address::ZERO,
+                            )
+                            .await
+                            {
+                                Ok(st) => {
+                                    let issuer: [u8; 20] = st.issuer.into_array();
+                                    if issuer != *signer.eth_address() {
+                                        return Err(format!(
+                                        "--chequebook issuer 0x{} != signing key 0x{}: only the issuer can pay (relay enforces issuer==account)",
+                                        hex::encode(issuer),
+                                        hex::encode(signer.eth_address())
+                                    )
+                                    .into());
+                                    }
+                                    eprintln!(
+                                        "metered: chequebook=0x{} issuer=0x{} total_liquid={} PLUR chain={}",
+                                        hex::encode(cb),
+                                        hex::encode(issuer),
+                                        st.liquid_for_us,
+                                        cli.chequebook_chain_id,
+                                    );
+                                    (u128::try_from(st.liquid_for_us).unwrap_or(u128::MAX), true)
+                                }
+                                Err(e) => {
+                                    // Soft-fail: an RPC outage must not abort an
+                                    // upload whose lanes are all open/soft and
+                                    // would serve unpaid. Per-lane relay checks
+                                    // still enforce funding at accept time.
+                                    eprintln!(
+                                        "metered: chequebook state unreadable ({e}); continuing with no global balance pre-check"
+                                    );
+                                    (u128::MAX, false)
+                                }
+                            };
+                        let _ = issuer_ok;
                         let store = hoverfly::cheques::ChequeStore::load_or_create(
                             &cli.cheques_file,
                             cb,
                         )
                         .map_err(|e| format!("loading {}: {e}", cli.cheques_file.display()))?;
-                        eprintln!(
-                            "metered: chequebook=0x{} liquid={} PLUR",
-                            hex::encode(cb),
-                            st.liquid_for_us
-                        );
                         // `batch` is the hex string the user passed; the
                         // challenge binds the raw 32 bytes.
                         let batch_raw = hex::decode(batch.trim_start_matches("0x"))
@@ -2025,7 +2106,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             chequebook: cb,
                             chain_id: cli.chequebook_chain_id,
                             cheques: std::sync::Arc::new(std::sync::Mutex::new(store)),
-                            balance_plur: u128::try_from(st.liquid_for_us).unwrap_or(u128::MAX),
+                            balance_plur,
+                            pins,
                         })
                     }
                     None => None,
@@ -2365,14 +2447,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // and the only lever available on hosts where the command line
             // is fixed by the platform.
             let envs = |k: &str| std::env::var(k).ok().filter(|s| !s.trim().is_empty());
-            let meter = meter || envs("HOVERFLY_METER").is_some_and(|v| v != "0");
-            let meter_hard = meter_hard || envs("HOVERFLY_METER_HARD").is_some_and(|v| v != "0");
+            // Truthy parsing: `1`/`true`/`yes`/`on` enable; `0`/`false`/`no`/
+            // `off`/empty never do. The old `v != "0"` treated
+            // `HOVERFLY_METER=false` as *enabled* — a boolean footgun on a
+            // money switch.
+            let truthy = |v: &str| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            };
+            let meter = meter || envs("HOVERFLY_METER").is_some_and(|v| truthy(&v));
+            let meter_hard = meter_hard || envs("HOVERFLY_METER_HARD").is_some_and(|v| truthy(&v));
+            let split_origins = |v: String| -> Vec<String> {
+                v.split(',')
+                    .map(|s| s.trim().trim_end_matches('/').to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            };
             let origin = if origin.is_empty() {
                 envs("HOVERFLY_METER_ORIGIN")
-                    .map(|v| v.split(',').map(|s| s.trim().to_string()).collect())
+                    .map(split_origins)
                     .unwrap_or_default()
             } else {
-                origin
+                // CLI repeated `--origin a --origin b` is already split by
+                // clap; a single `--origin a,b` is one hostname that never
+                // matches — split it too so CLI and env agree.
+                origin.into_iter().flat_map(|o| split_origins(o)).collect()
             };
             let beneficiary = beneficiary.or_else(|| envs("HOVERFLY_METER_BENEFICIARY"));
             let state_dir = state_dir.or_else(|| envs("HOVERFLY_METER_STATE_DIR").map(Into::into));
@@ -2866,7 +2967,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        #[cfg(unix)]
         #[cfg(all(unix, feature = "pusher"))]
         Commands::Cashout {
             rpc_url,
@@ -3031,6 +3131,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .parse()
                     .map_err(|e| format!("--chequebook: {e}"))?;
                 let plur = parse_bzz_amount(&amount)?;
+                // Gnosis only: there is no vetted Sepolia BZZ token const,
+                // and funding via the wrong ERC-20 would transfer the wrong
+                // token (or fail confusingly). Reject non-Gnosis here rather
+                // than funding with the mainnet token address.
+                if chain_id != 100 {
+                    return Err(format!(
+                        "chequebook fund supports Gnosis (chain 100) only; got chain {chain_id}"
+                    )
+                    .into());
+                }
                 let bzz: alloy_primitives::Address = hoverfly::batch::MAINNET_BZZ_TOKEN
                     .parse()
                     .map_err(|e| format!("bzz token: {e}"))?;

@@ -1,8 +1,9 @@
 # Pusher incentives: paying for relay with SWAP cheques
 
-Status: **Stages 0 and 1 shipped (soft mode); Stages 2–3 outstanding.** A relay can be paid, but never
-refuses: soft mode meters, reports, and accepts cheques, and 402
-enforcement is Stage 2. See §14 for exactly what is and is not in. This doc
+Status: **Stages 0–2 shipped (soft + hard enforcement + cashout).** A relay meters, reports, accepts
+cumulative cheques, refuses over-cap accounts with 402 in hard mode, and held cheques are redeemable via
+`hoverfly cashout`. Stage 3 (erasure-aware completion policy) is outstanding. See §14 for exactly what is
+and is not in. This doc
 specifies an
 optional *metered* mode for `hoverfly pusher` in which a client pays the
 relay for bandwidth with off-chain SWAP cheques. It is a companion to
@@ -363,15 +364,21 @@ Two-phase. *Soft mode* first: the relay meters, accepts cheques, and
 reports `owed`, but **never answers 402** — an account over its credit line
 is recorded and served anyway.
 
-**Soft mode still requires the challenge.** An earlier draft of this
-section said existing clients "keep working", implying an unchallenged
-request should be served. That is wrong, and it was caught while trying to
-enable metering on a live lane: if a missing header meant "serve for free",
-metering would be bypassable by *omitting a header*, which is not a
-degraded mode but no mode at all. What soft mode drops is enforcement of
-the cap, not authentication. A relay flipping to `--meter` therefore does
-break clients that predate the protocol — acceptable, because the only
-dApp using these lanes ships alongside them.
+**Soft mode does not require the challenge; hard mode does.** A request
+with no challenge header is an unmetered request, served exactly as `open`
+mode serves it (with Stage 0 still shadow-counting it) — that is what lets
+a relay flip to `--meter` while the existing fleet keeps working, because
+clients that predate the protocol simply do not send the header. Requiring
+it unconditionally would 401 the whole fleet the moment metering was
+enabled, the opposite of a staged rollout. What soft mode drops is
+enforcement of the cap, not authentication of those who present one: a
+header that is *present but invalid* is refused (401) in both modes —
+claiming a capability you do not hold is not the same as not claiming one,
+and letting it through would make the check bypassable by corrupting a
+byte. (An earlier draft of this section said the opposite — that soft must
+require the challenge lest metering be bypassable by omitting a header.
+That confuses bypass with non-participation: an omitted header is billed
+nothing and grants nothing, served as `open`; a forged header is refused.)
 
 Only once clients in the wild can pay does a relay flip to hard mode.
 
@@ -571,7 +578,10 @@ carrying two more fields alongside a URL it already had costs nothing.
 ```
 
 Parameters are derived in §9 and §10.1; the ordering
-`min_cheque < settle_every < max_outstanding` is a hard invariant (§10.1).
+`min_cheque ≤ settle_every < max_outstanding` is a hard invariant (§10.1).
+`quote_valid_secs` (86400) must exceed one settlement period (§10.1 sizes
+~32 MiB per window); the client may cache the quote that long without
+re-reading `/v1/status`.
 
 ## 8. The billing unit: bytes admitted
 
@@ -1095,9 +1105,16 @@ every byte it sends regardless of outcome, so it can no longer buy cheap
 egress by aiming at badly-covered arcs — the arbitrage that made this
 economically rational under receipt billing is gone. What remains is pure
 griefing: the attacker burns its own credit to make the relay burn more.
-The amplification factor is the cost control that matters, so metered mode
-caps delivery *attempts* per chunk well below open mode's fallback and
-disables the past-`cap` walk.
+
+> **Not yet implemented:** metered pushes currently spend the same
+> downstream budget as open ones (`PUSH_MAX_RETRIES = 20`,
+> `src/pusher.rs:94,1818-1830`, no metered branch). Capping delivery
+> *attempts* per chunk below open mode's fallback and disabling the
+> past-`cap` walk for metered requests is outstanding work — the
+> amplification factor is the cost control that matters there. Until then,
+> treat the per-account cap (§11.2) as the griefing bound: an attacker can
+> multiply each admitted byte downstream, but each admitted byte is billed,
+> so the griefing budget is the credit line, not free.
 
 ### 11.6 HIGH — RPC amplification on `/v1/pay` (introduced)
 
@@ -1111,12 +1128,17 @@ cheapest-first and reach the chain only after every free check passes:
 4. `beneficiary == ours`, `chain_id == ours`.
 5. `cumulative > last_cumulative[chequebook]` and
    `amount ≥ min_cheque_plur`.
-6. *Then* RPC: `deployedContracts` (cache forever per chequebook),
-   `issuer()` (**cache per chequebook** — bee refetches it on every cheque
-   at `chequestore.go:149` despite its own comment saying it never
-   changes; do not copy that), `liquidBalanceFor(ourBeneficiary)` and
-   `paidOut(ourBeneficiary)` (uncacheable — they are the §11.2 check).
-   Read `bounced` in the same batch and refuse the chequebook if set.
+6. *Then* RPC: `deployedContracts` (positive cached 24 h, negative 10 min
+   per chequebook), `issuer()` (**cache per chequebook** — bee refetches
+   it on every cheque at `chequestore.go:149` despite its own comment
+   saying it never changes; do not copy that), `liquidBalanceFor`,
+   `paidOut` and `bounced` batched in one JSON-RPC request and cached 30 s
+   (`STATE_TTL`). The balance reads are the §11.2 check, and caching them
+   does not weaken it: §11.2 is true *at acceptance time, not at cashout* —
+   the issuer can withdraw the instant after acceptance, so a fresh read
+   only narrows the window against an exposure already bounded by
+   `max_outstanding` either way. What the cache buys is real: most cheques
+   cost zero chain reads (§10.1 windows ~2-3 cheques per 71 MB upload).
 
 **That ordering bounds nothing on its own.** Every "free" check passes for
 a cheque an attacker synthesizes at zero cost: it reads `beneficiary` and
@@ -1381,12 +1403,14 @@ chequebook as a deliberate opt-in. hoverfly has no deploy path today: it
 consumes a chequebook via `--chequebook` and documents "already deployed by
 bee's official factory" as a precondition.
 
-Two things remain before hard mode: the driver does not yet *act* on a 402
-by issuing a cheque and calling `Scheduler::fund_lane` (the pieces exist
-and are tested; the loop that connects them does not), and the `/v1/pay`
-chain reads have never been exercised against a real chequebook. Soft mode
-is what makes that ordering safe: a relay can run `--meter` against today's
-clients without breaking them, because nothing is refused.
+Hard mode is shipped: the driver settles on the window and on 402, calls
+`Scheduler::fund_lane` after an accepted cheque, reconciles carried debt
+via `/v1/account` when a 402 cannot be paid from local books (§17.1), and
+the `/v1/pay` chain reads (`deployedContracts`, `issuer`,
+`liquidBalanceFor`, `paidOut`, `bounced`) are exercised against Gnosis
+mainnet (§14 deployment notes). What remains is Stage 3 (erasure-aware
+completion) and the per-lane pin UX (`--lane-pin`; unpinned lanes are
+TOFU-trusted with a warning).
 
 
 - Byte accounting per account with a **body-bounded reservation** (§7.2,
@@ -1500,7 +1524,9 @@ Carried knowingly:
   client until `total_issued` ships.
 - **§11.5** — griefing by aiming at badly-covered arcs still forces the
   relay to spend more than the attacker pays, even though the attacker now
-  pays. Bounded by attempt caps, not eliminated.
+  pays. Bounded by the same attempt caps as open mode (no metered-specific
+  cap yet — see §11.5), not eliminated; the attacker-side bound is the
+  credit line.
 - **A relay can take payment and drop chunks.** Out of scope for
   cryptographic treatment by §2. What bounds it is that the client pinned
   the lane, caps its exposure at one credit line, and deweights a lane

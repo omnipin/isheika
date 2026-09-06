@@ -1273,6 +1273,22 @@ impl UploadSession {
             .on_batch_result(batch as u64, outcome, now_ms.max(0.0) as u64);
     }
 
+    /// A 402/401 is a bill (or stale capability), not a fault — pause the
+    /// lane without charging health or burning a retry attempt. The browser
+    /// has no chequebook, so a hard lane that flips mid-run pauses rather
+    /// than failing its chunks; hard lanes are still retired upfront via
+    /// `setLaneStatus`, this is the mid-run recovery.
+    #[wasm_bindgen(js_name = "reportPaymentRequired")]
+    pub fn report_payment_required(&mut self, batch: f64, _lane: usize, now_ms: f64) {
+        // `_lane` is for JS call-site symmetry with `reportBatch`; the
+        // scheduler resolves the lane from the batch id.
+        self.sched.on_batch_result(
+            batch as u64,
+            crate::pushsched::BatchOutcome::PaymentRequired,
+            now_ms.max(0.0) as u64,
+        );
+    }
+
     /// Milliseconds to wait before calling `nextRequest` again when it
     /// returned `undefined`. `0` means "there is work in flight, wait on
     /// that instead".

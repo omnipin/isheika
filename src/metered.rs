@@ -1,14 +1,15 @@
-//! Metered relay mode — `docs/pusher-incentives.md` Stage 1.
+//! Metered relay mode — `docs/pusher-incentives.md` Stages 1–2.
 //!
 //! Holds the state the metered endpoints share and implements their logic,
 //! so `src/pusher.rs` stays a router. Everything here defends the **relay**
 //! against the **client** (§2); nothing here tries to prove to a client that
 //! the relay did its work.
 //!
-//! Stage 1 runs in **soft mode**: the relay meters, reports, and accepts
-//! cheques, but never refuses a push. Hard mode (402 enforcement) is
-//! Stage 2 and flips one flag — the arithmetic that decides "over cap" is
-//! already computed here so the two modes cannot disagree about it.
+//! Soft mode meters, reports, and accepts cheques without refusing;
+//! hard mode (402 enforcement) flips one flag — the arithmetic that decides
+//! "over cap" is computed here so the two modes cannot disagree about it.
+//! Absent challenge headers are served as unmetered (`open`) in soft mode
+//! for staged rollout; present-but-invalid headers are refused in both.
 
 use crate::challenge::{
     ChallengeError, ChallengeFields, IssuedChallenge, MAX_CHALLENGE_HEADER, PresentedChallenge,
@@ -162,7 +163,7 @@ impl Metered {
             account,
             batch,
             origin: origin.to_string(),
-            expiry_unix: now + crate::challenge::CHALLENGE_TTL_SECS,
+            expiry_unix: now.saturating_add(crate::challenge::CHALLENGE_TTL_SECS),
             cap_plur: cap,
         };
         let secret = *self.ledger.lock().expect("ledger poisoned").secret();
@@ -270,6 +271,11 @@ impl Metered {
 
     /// Apply a cheque. Every free check runs before this is called; this is
     /// the ledger half only.
+    ///
+    /// Persist failure rolls back in memory and is propagated (caller
+    /// answers 5xx): accepting in memory but failing to durably record
+    /// `last_cumulative` re-opens §11.4's replay hole after a restart —
+    /// the same cheque would credit a second time.
     pub fn credit(
         &self,
         account: [u8; 20],
@@ -278,11 +284,15 @@ impl Metered {
         signature: [u8; 65],
     ) -> Result<u128, LedgerError> {
         let mut l = self.ledger.lock().expect("ledger poisoned");
+        let prev_owed = l.owed(&account);
+        let prev_held = l.held_cheque(&account, &chequebook);
+        let had_binding = l.had_binding(&chequebook);
         let accepted = l.credit(account, chequebook, cumulative, signature)?;
         // Persist immediately: the window between accepting a cheque and
         // durably recording its cumulative is exactly §11.4's replay hole.
         if let Err(e) = l.persist() {
-            tracing::error!("ledger persist after credit failed: {e}");
+            l.rollback_credit(account, chequebook, prev_owed, prev_held, had_binding);
+            return Err(LedgerError::Store(e.to_string()));
         }
         Ok(accepted)
     }
@@ -328,6 +338,10 @@ impl StateCache {
 
     fn remove(&mut self, k: &[u8; 20]) {
         self.map.remove(k);
+        // Drop the ghost from the eviction queue too: otherwise every pay
+        // leaves one slot behind, the next insert for the same key pushes a
+        // duplicate, and live entries are evicted early (extra eth_calls).
+        self.order.retain(|x| x != k);
     }
 }
 

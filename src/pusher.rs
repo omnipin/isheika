@@ -987,6 +987,13 @@ async fn pay_response(
                 }),
             )
         }
+        Err(crate::ledger::LedgerError::Store(e)) => {
+            tracing::error!("ledger persist after credit failed: {e}");
+            json_line_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "ledger write failed; re-present the same cheque",
+            )
+        }
         Err(e) => json_line_response(StatusCode::BAD_REQUEST, &e.to_string()),
     }
 }
@@ -1009,6 +1016,11 @@ fn account_response(state: &State, headers: &hyper::HeaderMap) -> Response<RespB
         Err(e) => return json_line_response(StatusCode::UNAUTHORIZED, &e),
     };
     let l = m.ledger.lock().expect("ledger poisoned");
+    // Report the *effective* thresholds for this account's line, not the
+    // configured ones: `/v1/pay` enforces `effective(cap)`, and a client
+    // following the configured numbers would wait for a settlement it can
+    // never reach on a small batch (the case `Params::effective` exists for).
+    let eff = m.cfg.params.effective(verified.cap_plur);
     json_response(
         StatusCode::OK,
         &serde_json::json!({
@@ -1017,8 +1029,8 @@ fn account_response(state: &State, headers: &hyper::HeaderMap) -> Response<RespB
             "reserved_plur": l.reserved(&verified.account).to_string(),
             "outstanding_plur": l.outstanding(&verified.account).to_string(),
             "max_outstanding_plur": verified.cap_plur.to_string(),
-            "settle_every_plur": m.cfg.params.settle_every_plur.to_string(),
-            "min_cheque_plur": m.cfg.params.min_cheque_plur.to_string(),
+            "settle_every_plur": eff.settle_every_plur.to_string(),
+            "min_cheque_plur": eff.min_cheque_plur.to_string(),
         }),
     )
 }
@@ -2428,6 +2440,13 @@ fn payment_quote(state: &State) -> Option<serde_json::Value> {
     let m = state.metered.as_ref()?;
     let push = state.push.as_ref()?;
     let p = &m.cfg.params;
+    // `origin` advertises the first configured hostname: issuance binds
+    // only that one (`origins.first()`), while verification accepts any
+    // configured origin. Extra `--origin` values are accept-list entries
+    // for multi-host relays, not separately advertised lines.
+    // `quote_valid_secs` is how long the client may treat this quote as
+    // current without re-reading `/v1/status` (§7.2/§11.9): 24 h, which
+    // exceeds one settlement period (§10.1 sizes ~32 MiB per window).
     let mut body = serde_json::json!({
         "mode": "metered",
         "enforcement": if m.cfg.hard_mode { "hard" } else { "soft" },
@@ -2443,6 +2462,7 @@ fn payment_quote(state: &State) -> Option<serde_json::Value> {
         "max_outstanding_plur": p.max_outstanding_plur.to_string(),
         "credit_ratio": p.credit_ratio,
         "challenge_ttl_secs": crate::challenge::CHALLENGE_TTL_SECS,
+        "quote_valid_secs": 86_400,
     });
     // Sign the canonical serialization of the block itself, so what the
     // client verifies is exactly what it read.

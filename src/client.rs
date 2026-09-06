@@ -2718,7 +2718,19 @@ where
         // A lane quoting more than this is refused rather than paid.
         // Priced off the shipped default so a lane cannot quietly
         // charge an order of magnitude more than the design assumes.
-        fetch_lane_info(&http, u, crate::meter::PRICE_PLUR_PER_KIB * 8)
+        // Pins + chain come from the payment config when present: without a
+        // pin the quote is TOFU-trusted for the run (warned inside).
+        let (pin, chain) = match payment {
+            Some(pc) => {
+                let key = u.trim_end_matches('/').to_string();
+                // `pins` is keyed by URL without trailing slash (see
+                // `parse_lane_pins`); also try the raw form.
+                let p = pc.pins.get(&key).or_else(|| pc.pins.get(u));
+                (p, Some(pc.chain_id))
+            }
+            None => (None, None),
+        };
+        fetch_lane_info(&http, u, crate::meter::PRICE_PLUR_PER_KIB * 8, pin, chain)
     }))
     .await;
     for (i, (u, info)) in pusher_urls.iter().zip(&infos).enumerate() {
@@ -2839,10 +2851,13 @@ where
             }
         }
     }
-    // batch id -> body bytes, so a completed POST can be billed for what
-    // it actually sent. The relay bills what it *admits*, so a refused POST
-    // must not become debt on this side either.
-    let mut in_flight_bytes: HashMap<u64, u64> = HashMap::new();
+    // batch id -> (lane, body bytes), so a completed POST can be billed to
+    // the lane that actually sent it. The relay bills what it *admits*, so
+    // a refused POST must not become debt on this side either. Keyed by lane
+    // because a multi-lane run strands POSTs on several lanes: attributing
+    // every stranded body to the first payer with pending debt over-pays one
+    // beneficiary and under-pays the other.
+    let mut in_flight_bytes: HashMap<u64, (usize, u64)> = HashMap::new();
     let mut sched = Scheduler::new(infos, cfg);
     for &i in &unusable {
         sched.retire_lane(i);
@@ -2944,9 +2959,17 @@ where
                         anyone_can_take_work = true;
                         continue;
                     };
-                    let affordable = p.affordable_frames();
-                    if affordable > 0 {
-                        sched.set_lane_batch_max(lane, affordable.min(lane_frame_ceiling[lane]));
+                    // `cap == 0` means no challenge yet: sizing is unknown,
+                    // so keep the relay's advertised ceiling rather than
+                    // raising it to `MAX` (which would build an unbounded
+                    // POST). `affordable_frames` returns `MAX` as the
+                    // unknown sentinel — skip the clamp in that case.
+                    if p.cap_known() {
+                        let affordable = p.affordable_frames();
+                        if affordable > 0 && affordable != usize::MAX {
+                            sched
+                                .set_lane_batch_max(lane, affordable.min(lane_frame_ceiling[lane]));
+                        }
                     }
                     if p.has_headroom() {
                         anyone_can_take_work = true;
@@ -2959,6 +2982,33 @@ where
                 None
             }
         } {
+            // Per-lane headroom: the gate above is global, but the scheduler
+            // picks the lane. If it picked a metered lane that cannot afford
+            // even one frame, hand the assignment straight back (cheap now
+            // that `PaymentRequired` no longer burns an attempt) and stop
+            // dispatching until something completes — rather than building a
+            // full-size POST the relay must refuse.
+            if let (Some(_pc), Some(payer)) = (payment, payers[a.lane].as_ref()) {
+                if payer.cap_known() && !payer.has_headroom() {
+                    sched.on_batch_result(
+                        a.batch,
+                        crate::pushsched::BatchOutcome::PaymentRequired,
+                        now_ms(),
+                    );
+                    break;
+                }
+                if payer.cap_known() {
+                    let affordable = payer.affordable_frames();
+                    if affordable == 0 {
+                        sched.on_batch_result(
+                            a.batch,
+                            crate::pushsched::BatchOutcome::PaymentRequired,
+                            now_ms(),
+                        );
+                        break;
+                    }
+                }
+            }
             let batch: Vec<StampedChunk> = a
                 .chunks
                 .iter()
@@ -3000,6 +3050,14 @@ where
                     // Hand the batch back instead and let it be re-dispatched
                     // once something completes — the same pause a 402 would
                     // cause, without the round trip.
+                    if payer.would_exceed(body_bytes) {
+                        sched.on_batch_result(
+                            batch_id,
+                            crate::pushsched::BatchOutcome::PaymentRequired,
+                            now_ms(),
+                        );
+                        continue;
+                    }
                 }
                 match payer.header(&http, pc).await {
                     Ok(h) => challenge = Some(h.to_string()),
@@ -3015,7 +3073,7 @@ where
                     }
                 }
                 payer.account.record_sent(body_bytes);
-                in_flight_bytes.insert(batch_id, body_bytes);
+                in_flight_bytes.insert(batch_id, (lane, body_bytes));
             }
             tokio::spawn(async move {
                 post_batch_streaming(
@@ -3128,9 +3186,15 @@ where
                     matches!(outcome, crate::pushsched::BatchOutcome::PaymentRequired);
                 // Turn the in-flight bytes into debt only if the relay
                 // actually took them.
-                if let Some(sent) = in_flight_bytes.remove(&batch)
+                if let Some((sent_lane, sent)) = in_flight_bytes.remove(&batch)
                     && let Some(payer) = payers[lane].as_mut()
                 {
+                    // Defensive: the Done event carries its lane, which must
+                    // match where the bytes were recorded. On mismatch bill
+                    // the recorded lane (the one that sent) — never a third
+                    // lane.
+                    debug_assert_eq!(sent_lane, lane);
+                    let _ = sent_lane;
                     // The question is whether the relay *read the body*, not
                     // whether we got a clean answer back. A 402 is refused at
                     // admission, before a byte is read, so it costs nothing
@@ -3155,6 +3219,15 @@ where
                 if let (Some(pc), Some(payer)) = (payment, payers[lane].as_mut())
                     && (needs_payment || payer.account.should_settle())
                 {
+                    // A 401 arrives here as `PaymentRequired` (see
+                    // `post_batch_streaming`): the cached capability is stale,
+                    // so drop it — otherwise the same bad header is retried
+                    // until expiry, charging pauses instead of recovering.
+                    // Clearing on a 402 too costs one extra challenge GET per
+                    // settlement, which is cheap and re-reads the live line.
+                    if needs_payment {
+                        payer.clear_header();
+                    }
                     match payer.settle(&http, pc).await {
                         Ok(Some(c)) => {
                             info!(target: "hoverfly::upload",
@@ -3221,15 +3294,12 @@ where
     // debt — leaving them in `pending` meant the final settlement saw
     // nothing to pay and the relay kept the balance forever.
     if payment.is_some() {
-        for (_, sent) in in_flight_bytes.drain() {
-            // Lane is unknown here, but a single-lane run is the only case
-            // that can strand bytes this way; charge every payer's share by
-            // attributing to the lane that still has pending debt.
-            for payer in payers.iter_mut().flatten() {
-                if payer.account.outstanding() > payer.account.owed() {
-                    payer.account.record_answered(sent, true);
-                    break;
-                }
+        // The loop exits once every *chunk* is acked, which happens before
+        // every *response* has closed. Those bodies were read and billed, so
+        // convert each stranded POST on the lane that sent it.
+        for (_, (sent_lane, sent)) in in_flight_bytes.drain() {
+            if let Some(payer) = payers.get_mut(sent_lane).and_then(|p| p.as_mut()) {
+                payer.account.record_answered(sent, true);
             }
         }
     }
@@ -3484,6 +3554,16 @@ async fn post_batch_streaming(
             finish(BatchOutcome::PaymentRequired, 0, 0);
             return;
         }
+        // A 401 is a stale/invalid capability (expired challenge, wrong
+        // origin/account/batch) — not a fault in the lane. Pausing (not
+        // failing) lets the driver drop the cached header, refetch, and
+        // retry without charging lane health.
+        if code == reqwest::StatusCode::UNAUTHORIZED {
+            info!(target: "hoverfly::upload",
+                "lane {push_url} rejected capability ({code}): {}", txt.trim());
+            finish(BatchOutcome::PaymentRequired, 0, 0);
+            return;
+        }
         warn!(target: "hoverfly::upload",
             "lane {push_url} rejected batch ({code}): {}", txt.trim());
         finish(BatchOutcome::Failed(format!("http {code}")), 0, 0);
@@ -3562,6 +3642,8 @@ async fn fetch_lane_info(
     http: &reqwest::Client,
     base_url: &str,
     price_ceiling: u128,
+    pin: Option<&crate::payer::LanePin>,
+    expected_chain_id: Option<u64>,
 ) -> crate::pushsched::LaneInfo {
     use crate::pushsched::LaneInfo;
     let url = format!("{}/v1/status", base_url.trim_end_matches('/'));
@@ -3596,12 +3678,29 @@ async fn fetch_lane_info(
             // deriving the overlay only turns the lane's own `overlay`
             // field from an assertion into a check. A caller that pins
             // does the full version.
-            match crate::payer::PaymentQuote::verify(pay, None, 0, None, price_ceiling) {
-                Ok(q) => (
-                    Some(q.params.price_plur_per_kib),
-                    q.hard_enforcement,
-                    Some(q),
-                ),
+            match crate::payer::PaymentQuote::verify(pay, None, 0, pin, price_ceiling) {
+                Ok(q) => {
+                    if let Some(expected) = expected_chain_id
+                        && q.chain_id != expected
+                    {
+                        warn!(target: "hoverfly::upload",
+                            "lane {base_url}: quotes chain {} but client pays on chain {expected}; treating as unmetered",
+                            q.chain_id);
+                        (None, false, None)
+                    } else {
+                        if pin.is_none() {
+                            warn!(target: "hoverfly::upload",
+                                "lane {base_url}: metered but unpinned — trusting first-seen identity 0x{}/0x{} for this run (pass --lane-pin to pin)",
+                                hex::encode(q.node_eth_address),
+                                hex::encode(q.beneficiary));
+                        }
+                        (
+                            Some(q.params.price_plur_per_kib),
+                            q.hard_enforcement,
+                            Some(q),
+                        )
+                    }
+                }
                 Err(e) => {
                     warn!(target: "hoverfly::upload",
                         "lane {base_url}: payment quote rejected ({e}); treating as unmetered");
@@ -5820,9 +5919,14 @@ async fn try_push_with_rotation(
     }
 
     // Wire-level outcome diagnostics — mirrors bee's
-    // `bee_pushsync_*` counters at /metrics. Bumped here (not at
-    // the chunk dispatcher) so we capture every per-stream attempt,
-    // including losing racers that still produced a receipt.
+    // `bee_pushsync_*` counters at /metrics. Bumped after the await inside
+    // the racing future, so this counts *completions*, not dispatches: a
+    // losing racer cancelled before it completes spent egress (its Delivery
+    // is already on the wire) but never reaches this increment. Do NOT use
+    // `attempts_per_frame` derived from these counters as §9.1's egress
+    // multiplier — it floors near 1.0 by construction (see `meter.rs` and
+    // `pusher.rs::stream_attempts`). Counting at dispatch, beside
+    // `inflight_pushes`, is the fix.
     let result = result;
     match &result {
         Ok(PushOutcome::Overdraft) => {

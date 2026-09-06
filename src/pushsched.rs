@@ -838,8 +838,18 @@ impl Scheduler {
             // payment. Pause the lane without touching `fail_streak` or
             // `backoff_exp`, so settling restores it instantly and a long
             // upload is not punished for crossing a settlement window.
+            // It also must not consume a retry attempt: a routine
+            // settlement every ~32 MiB would otherwise fail a large upload
+            // after a handful of windows. Undo the dispatch increment.
             BatchOutcome::PaymentRequired => {
                 self.lanes[lane].health = LaneHealth::Unfunded;
+                for &ci in &chunks {
+                    let c = &mut self.chunks[ci];
+                    if matches!(c.phase, ChunkPhase::Done | ChunkPhase::Skipped) {
+                        continue;
+                    }
+                    c.attempts = c.attempts.saturating_sub(1);
+                }
             }
             _ => {
                 let l = &mut self.lanes[lane];
@@ -1009,12 +1019,25 @@ impl Scheduler {
         let any_eligible = self.lanes.iter().any(|l| l.eligible(now_ms));
         if !any_eligible {
             // Backed-off lanes will come back; only a fully retired set is
-            // terminal.
+            // terminal. An all-`Unfunded` set with nothing in flight is the
+            // same kind of terminal for a driver that cannot mint a cheque
+            // (dust residual below the floor): report it rather than
+            // waiting on a channel that never fires.
             let all_retired = self
                 .lanes
                 .iter()
                 .all(|l| matches!(l.health, LaneHealth::Retired));
-            return all_retired.then_some(StallReason::AllLanesDown);
+            if all_retired {
+                return Some(StallReason::AllLanesDown);
+            }
+            let all_unfunded_or_retired = self
+                .lanes
+                .iter()
+                .all(|l| matches!(l.health, LaneHealth::Retired | LaneHealth::Unfunded));
+            if all_unfunded_or_retired {
+                return Some(StallReason::AllLanesDown);
+            }
+            return None;
         }
         if self.pending.is_empty() {
             return Some(StallReason::ChunksExhausted);
