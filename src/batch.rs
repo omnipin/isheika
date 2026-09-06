@@ -655,14 +655,30 @@ struct EthRpc {
     http: reqwest::Client,
 }
 
+/// One process-wide HTTP client for every `eth_call`.
+///
+/// `EthRpc::new` is called per read (`read_batch`, `read_remaining_balance`,
+/// `read_last_price`, …), and building a fresh `reqwest::Client` each time
+/// means a fresh connection pool, so every read paid a full TLS handshake
+/// and none were ever reused. On the pusher's hot path that is one handshake
+/// per batch resolution; under a flood of unresolvable batch ids it was one
+/// per frame. `reqwest::Client` is an `Arc` internally, so cloning it shares
+/// the pool.
+fn shared_http() -> &'static reqwest::Client {
+    static HTTP: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    HTTP.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .expect("reqwest client")
+    })
+}
+
 impl EthRpc {
     fn new(url: String) -> Self {
         Self {
             url,
-            http: reqwest::Client::builder()
-                .timeout(Duration::from_secs(30))
-                .build()
-                .expect("reqwest client"),
+            http: shared_http().clone(),
         }
     }
 
@@ -1051,5 +1067,535 @@ mod tests {
         // 24h = 86400s; blocks = 86400 / 5 = 17280; with last_price=1
         // amount = 17280 + 10 (buffer)
         assert_eq!(amount_for_duration(1, 86400), U256::from(17290u64));
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Chequebook reads (metered relay — docs/pusher-incentives.md Stage 1)
+// ──────────────────────────────────────────────────────────────────────
+
+sol! {
+    // ERC20SimpleSwap / SimpleSwapFactory, from
+    // github.com/ethersphere/swap-swear-and-swindle.
+    function issuer() external view returns (address);
+    function paidOut(address beneficiary) external view returns (uint256);
+    function bounced() external view returns (bool);
+    // NOT `balance()`. `liquidBalance() = balance() - totalHardDeposit`, and
+    // `liquidBalanceFor(b) = liquidBalance() + hardDeposits[b].amount`, which
+    // is what `_cashChequeInternal` actually pays against. Bee checks
+    // `balance()`, counting *other* beneficiaries' hard deposits as our
+    // coverage — unsound in general, invisible only because bee never places
+    // any (incentives §11.2).
+    function liquidBalanceFor(address beneficiary) external view returns (uint256);
+    function deployedContracts(address who) external view returns (bool);
+}
+
+/// Canonical `SimpleSwapFactory` per chain (`bee/pkg/config/chain.go:66,89`).
+/// **Hardcoded on purpose.** A factory address supplied by the client lets it
+/// present a contract that returns a forged `issuer()` and
+/// `liquidBalanceFor()` and implements `cashChequeBeneficiary` as a no-op —
+/// total compromise for one `eth_call` saved (incentives §6).
+pub const GNOSIS_SWAP_FACTORY: &str = "0xc2d5a532cf69aa9a1378737d8ccdef884b6e7420";
+pub const SEPOLIA_SWAP_FACTORY: &str = "0x0fF044F6bB4F684a5A149B46D7eC03ea659F98A1";
+
+/// The factory for a chain, or `None` if we have no vetted address for it —
+/// in which case metered mode must not run, rather than fall back to
+/// something the client names.
+pub fn swap_factory_for_chain(chain_id: u64) -> Option<Address> {
+    let s = match chain_id {
+        100 => GNOSIS_SWAP_FACTORY,
+        11155111 => SEPOLIA_SWAP_FACTORY,
+        _ => return None,
+    };
+    s.parse().ok()
+}
+
+/// What the relay needs to know about a chequebook to accept a cheque
+/// drawn on it.
+#[derive(Debug, Clone, Copy)]
+pub struct ChequebookState {
+    pub issuer: Address,
+    /// Everything this beneficiary could actually cash right now.
+    pub liquid_for_us: U256,
+    /// Already cashed by this beneficiary; the cheque's cumulative must
+    /// exceed it or there is nothing left to draw.
+    pub paid_out_to_us: U256,
+    /// Set permanently, contract-wide, the first time any cheque could not
+    /// be paid in full. Readable state rather than an event you had to have
+    /// been watching for (incentives §11.2).
+    pub bounced: bool,
+}
+
+/// Is this address a chequebook the canonical factory deployed?
+///
+/// Cache this forever per address on a `true`, and negative-cache a `false`
+/// — it is the first chain read an unauthenticated `/v1/pay` can reach, so
+/// an uncached miss is a one-RPC-per-request amplifier (incentives §11.6).
+pub async fn is_deployed_chequebook(
+    rpc_url: &str,
+    factory: Address,
+    chequebook: Address,
+) -> Result<bool, BatchError> {
+    EthRpc::new(rpc_url.to_string())
+        .call_view(factory, deployedContractsCall { who: chequebook })
+        .await
+}
+
+/// Read the four values that decide whether a cheque is worth anything —
+/// in **one** JSON-RPC round trip.
+///
+/// They used to be four sequential `eth_call`s, which put four round trips
+/// on the critical path of every `/v1/pay`. They are all reads against the
+/// same block, so there is no reason for them to be sequential: batching
+/// them makes the miss case one request, and the caller (`Metered`) caches
+/// on top so the honest path is usually zero.
+pub async fn read_chequebook_state(
+    rpc_url: &str,
+    chequebook: Address,
+    beneficiary: Address,
+) -> Result<ChequebookState, BatchError> {
+    let rpc = EthRpc::new(rpc_url.to_string());
+    let calls = [
+        issuerCall {}.abi_encode(),
+        liquidBalanceForCall { beneficiary }.abi_encode(),
+        paidOutCall { beneficiary }.abi_encode(),
+        bouncedCall {}.abi_encode(),
+    ];
+    let out = rpc.batch_call_view(chequebook, &calls).await?;
+    let dec = |i: usize| -> Result<&Vec<u8>, BatchError> {
+        out.get(i)
+            .ok_or_else(|| BatchError::Rpc("short batch response".into()))
+    };
+    Ok(ChequebookState {
+        issuer: issuerCall::abi_decode_returns(dec(0)?)
+            .map_err(|e| BatchError::AbiDecode(e.to_string()))?,
+        liquid_for_us: liquidBalanceForCall::abi_decode_returns(dec(1)?)
+            .map_err(|e| BatchError::AbiDecode(e.to_string()))?,
+        paid_out_to_us: paidOutCall::abi_decode_returns(dec(2)?)
+            .map_err(|e| BatchError::AbiDecode(e.to_string()))?,
+        bounced: bouncedCall::abi_decode_returns(dec(3)?)
+            .map_err(|e| BatchError::AbiDecode(e.to_string()))?,
+    })
+}
+
+impl EthRpc {
+    /// Several `eth_call`s to one contract in a single JSON-RPC batch.
+    ///
+    /// Results come back keyed by request id rather than in order — the
+    /// spec permits a server to reorder them, and some do — so they are
+    /// re-sorted before being returned.
+    async fn batch_call_view(
+        &self,
+        to: Address,
+        calls: &[Vec<u8>],
+    ) -> Result<Vec<Vec<u8>>, BatchError> {
+        #[derive(Serialize)]
+        struct BatchReq<'a> {
+            jsonrpc: &'a str,
+            id: usize,
+            method: &'a str,
+            params: (CallObj, &'a str),
+        }
+        let to_hex = format!("0x{}", hex::encode(to));
+        let reqs: Vec<BatchReq> = calls
+            .iter()
+            .enumerate()
+            .map(|(i, data)| BatchReq {
+                jsonrpc: "2.0",
+                id: i,
+                method: "eth_call",
+                params: (
+                    CallObj {
+                        from: format!("0x{}", hex::encode(Address::ZERO)),
+                        to: to_hex.clone(),
+                        data: format!("0x{}", hex::encode(data)),
+                    },
+                    "latest",
+                ),
+            })
+            .collect();
+        let resp: Vec<serde_json::Value> = self
+            .http
+            .post(&self.url)
+            .json(&reqs)
+            .send()
+            .await?
+            .json()
+            .await?;
+        if resp.len() != calls.len() {
+            return Err(BatchError::Rpc(format!(
+                "batch eth_call: sent {} requests, got {} responses",
+                calls.len(),
+                resp.len()
+            )));
+        }
+        let mut out = vec![Vec::new(); calls.len()];
+        for item in resp {
+            if let Some(err) = item.get("error") {
+                return Err(BatchError::Rpc(format!("batch eth_call: {err}")));
+            }
+            let id = item
+                .get("id")
+                .and_then(|i| i.as_u64())
+                .ok_or_else(|| BatchError::Rpc("batch eth_call: missing id".into()))?
+                as usize;
+            let hex_str = item
+                .get("result")
+                .and_then(|r| r.as_str())
+                .ok_or_else(|| BatchError::Rpc("batch eth_call: missing result".into()))?;
+            let slot = out
+                .get_mut(id)
+                .ok_or_else(|| BatchError::Rpc(format!("batch eth_call: bad id {id}")))?;
+            *slot = hex::decode(hex_str.trim_start_matches("0x"))?;
+        }
+        Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod chequebook_binding_tests {
+    use super::*;
+
+    /// Selectors are what the node dispatches on, so a wrong one silently
+    /// reads a *different* function rather than failing. Pinned against
+    /// `keccak256(signature)[..4]`.
+    #[test]
+    fn selectors_match_the_solidity_signatures() {
+        use alloy_sol_types::SolCall;
+        for (got, sig) in [
+            (issuerCall::SELECTOR, "issuer()"),
+            (paidOutCall::SELECTOR, "paidOut(address)"),
+            (bouncedCall::SELECTOR, "bounced()"),
+            (liquidBalanceForCall::SELECTOR, "liquidBalanceFor(address)"),
+            (
+                deployedContractsCall::SELECTOR,
+                "deployedContracts(address)",
+            ),
+        ] {
+            let want: [u8; 32] = <sha3::Keccak256 as sha3::Digest>::digest(sig.as_bytes()).into();
+            assert_eq!(got, want[..4], "selector drift for {sig}");
+        }
+    }
+
+    /// A relay must never accept a factory address from the wire, and must
+    /// refuse to run metered on a chain it has no vetted factory for.
+    #[test]
+    fn only_known_chains_have_a_factory() {
+        assert!(swap_factory_for_chain(100).is_some(), "gnosis");
+        assert!(swap_factory_for_chain(11155111).is_some(), "sepolia");
+        assert!(
+            swap_factory_for_chain(1).is_none(),
+            "mainnet: no vetted factory"
+        );
+        assert!(swap_factory_for_chain(31337).is_none(), "local devnet");
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Chequebook deployment (docs/pusher-incentives.md §14)
+// ──────────────────────────────────────────────────────────────────────
+
+sol! {
+    // SimpleSwapFactory.deploySimpleSwap(issuer, defaultHardDepositTimeoutDuration, salt)
+    function deploySimpleSwap(
+        address issuer,
+        uint256 defaultHardDepositTimeoutDuration,
+        bytes32 salt
+    ) external returns (address);
+
+    event SimpleSwapDeployed(address contractAddress);
+
+    function transfer(address to, uint256 amount) external returns (bool);
+}
+
+#[derive(Debug, Clone)]
+pub struct DeployChequebookParams {
+    pub rpc_url: String,
+    pub chain_id: u64,
+    pub factory: Address,
+    /// Must be the **batch owner's** address (§6): a relay only accepts a
+    /// cheque whose chequebook `issuer()` equals the account it billed.
+    pub issuer: Address,
+    pub receipt_timeout: std::time::Duration,
+}
+
+#[derive(Debug, Clone)]
+pub struct DeployedChequebook {
+    pub address: Address,
+    pub tx: B256,
+    /// True when the address already held code before we sent anything —
+    /// the deploy is deterministic in `(issuer, timeout, salt)`, so a repeat
+    /// with the same salt would revert rather than make a second one.
+    pub already_deployed: bool,
+}
+
+/// Deploy a chequebook through bee's canonical factory.
+///
+/// **Deliberately its own command, never a side effect of an upload.**
+/// Deploying a contract is irreversible and spends real funds; an upload
+/// that did it silently because some lane quoted a price would fire on the
+/// first metered lane a user ever met, before they had decided they wanted
+/// to pay at all.
+///
+/// The hard-deposit timeout is **0**, matching what bee deploys
+/// (`init.go:169`). That means deposits are not actually locked — see
+/// §11.2 — but it keeps us byte-compatible with every bee chequebook, and
+/// a non-zero timeout can be set later per beneficiary via
+/// `setCustomHardDepositTimeout` if secured mode is ever wanted.
+pub async fn deploy_chequebook(
+    signer: &PrivateKeySigner,
+    params: DeployChequebookParams,
+) -> Result<DeployedChequebook, BatchError> {
+    let rpc = EthRpc::new(params.rpc_url.clone());
+
+    let mut salt_bytes = [0u8; 32];
+    getrandom::fill(&mut salt_bytes).map_err(|e| BatchError::Rpc(format!("getrandom: {e}")))?;
+    let salt = B256::from(salt_bytes);
+
+    let call = deploySimpleSwapCall {
+        issuer: params.issuer,
+        defaultHardDepositTimeoutDuration: U256::ZERO,
+        salt,
+    };
+
+    // Simulate first. The factory returns the address it *would* create, so
+    // a revert (bad issuer, salt collision) surfaces here for free instead
+    // of as a burnt transaction.
+    let predicted: Address = rpc.call_view(params.factory, call.clone()).await?;
+    let existing = rpc.code_len(predicted).await?;
+    if existing > 0 {
+        return Ok(DeployedChequebook {
+            address: predicted,
+            tx: B256::ZERO,
+            already_deployed: true,
+        });
+    }
+
+    let tx = rpc
+        .send_signed(signer, params.chain_id, params.factory, &call.abi_encode())
+        .await?;
+    rpc.wait_for_success(tx, params.receipt_timeout).await?;
+
+    // Trust the chain, not the simulation: read the address back out of the
+    // receipt's `SimpleSwapDeployed` log.
+    let deployed = rpc.find_deployed_chequebook(tx).await?.unwrap_or(predicted);
+
+    // The relay checks this before accepting any cheque (§6), so checking it
+    // here turns "your cheques are silently refused" into a deploy-time
+    // error.
+    let issuer: Address = rpc.call_view(deployed, issuerCall {}).await?;
+    if issuer != params.issuer {
+        return Err(BatchError::Rpc(format!(
+            "deployed chequebook {deployed} has issuer {issuer}, expected {}",
+            params.issuer
+        )));
+    }
+    Ok(DeployedChequebook {
+        address: deployed,
+        tx,
+        already_deployed: false,
+    })
+}
+
+/// Move BZZ into a chequebook. Plain ERC-20 transfer — the contract holds
+/// whatever balance the token says it does, and `liquidBalanceFor` is
+/// derived from it.
+pub async fn fund_chequebook(
+    signer: &PrivateKeySigner,
+    rpc_url: &str,
+    chain_id: u64,
+    bzz_token: Address,
+    chequebook: Address,
+    amount: U256,
+    receipt_timeout: std::time::Duration,
+) -> Result<B256, BatchError> {
+    let rpc = EthRpc::new(rpc_url.to_string());
+    let from = signer.address();
+    let balance: U256 = rpc
+        .call_view(bzz_token, balanceOfCall { account: from })
+        .await?;
+    if balance < amount {
+        return Err(BatchError::InsufficientBalance {
+            have: balance,
+            need: amount,
+        });
+    }
+    // Refuse to fund something that is not a chequebook: a mistyped address
+    // sends BZZ somewhere unrecoverable.
+    let issuer: Address = rpc
+        .call_view(chequebook, issuerCall {})
+        .await
+        .map_err(|e| {
+            BatchError::Rpc(format!(
+                "{chequebook} does not answer issuer() — is it a chequebook? ({e})"
+            ))
+        })?;
+    if issuer != from {
+        return Err(BatchError::Rpc(format!(
+            "chequebook {chequebook} is issued by {issuer}, not {from}: only the issuer \
+             can ever withdraw, so funding it would strand the deposit"
+        )));
+    }
+    let call = transferCall {
+        to: chequebook,
+        amount,
+    }
+    .abi_encode();
+    let tx = rpc.send_signed(signer, chain_id, bzz_token, &call).await?;
+    rpc.wait_for_success(tx, receipt_timeout).await?;
+    Ok(tx)
+}
+
+impl EthRpc {
+    /// `eth_getCode` length, for "is there already a contract here".
+    async fn code_len(&self, addr: Address) -> Result<usize, BatchError> {
+        let hex_str: String = self
+            .raw(
+                "eth_getCode",
+                (format!("0x{}", hex::encode(addr)), "latest"),
+            )
+            .await?;
+        Ok(hex_str.trim_start_matches("0x").len() / 2)
+    }
+
+    /// Pull the chequebook address out of a deploy receipt's logs.
+    async fn find_deployed_chequebook(&self, tx: B256) -> Result<Option<Address>, BatchError> {
+        let receipt: serde_json::Value = self
+            .raw(
+                "eth_getTransactionReceipt",
+                (format!("0x{}", hex::encode(tx)),),
+            )
+            .await?;
+        let topic = SimpleSwapDeployed::SIGNATURE_HASH;
+        let Some(logs) = receipt.get("logs").and_then(|l| l.as_array()) else {
+            return Ok(None);
+        };
+        for log in logs {
+            let topics: Vec<String> = log
+                .get("topics")
+                .and_then(|t| t.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if topics
+                .first()
+                .map(|t| t.trim_start_matches("0x").to_lowercase())
+                != Some(hex::encode(topic))
+            {
+                continue;
+            }
+            // Non-indexed single address parameter: it is the data word.
+            if let Some(data) = log.get("data").and_then(|d| d.as_str()) {
+                let raw = hex::decode(data.trim_start_matches("0x"))
+                    .map_err(|e| BatchError::Rpc(format!("log data hex: {e}")))?;
+                if raw.len() >= 32 {
+                    return Ok(Some(Address::from_slice(&raw[12..32])));
+                }
+            }
+        }
+        Ok(None)
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Cashing out (docs/pusher-incentives.md §14 Stage 2)
+// ──────────────────────────────────────────────────────────────────────
+
+sol! {
+    function cashChequeBeneficiary(
+        address recipient,
+        uint256 cumulativePayout,
+        bytes issuerSig
+    ) external;
+}
+
+/// What a cheque is actually worth right now, before spending gas on it.
+#[derive(Debug, Clone, Copy)]
+pub struct CashoutQuote {
+    /// `cumulative - paidOut(beneficiary)`: what is still unclaimed.
+    pub requested_plur: U256,
+    /// `min(requested, liquidBalanceFor(beneficiary))` — what the contract
+    /// would actually transfer.
+    pub payable_plur: U256,
+    /// True when the chequebook cannot cover the whole claim. The cashout
+    /// still succeeds and takes what is there — `_cashChequeInternal` does
+    /// not revert — but it sets `bounced` permanently.
+    pub would_bounce: bool,
+    pub already_bounced: bool,
+}
+
+/// Price a cheque without sending anything.
+///
+/// Worth doing first because gas is spent whether or not the cheque is
+/// worth cashing, and a cumulative at or below `paidOut` transfers nothing
+/// at all.
+pub async fn quote_cashout(
+    rpc_url: &str,
+    chequebook: Address,
+    beneficiary: Address,
+    cumulative_plur: U256,
+) -> Result<CashoutQuote, BatchError> {
+    let st = read_chequebook_state(rpc_url, chequebook, beneficiary).await?;
+    let requested_plur = cumulative_plur.saturating_sub(st.paid_out_to_us);
+    let payable_plur = requested_plur.min(st.liquid_for_us);
+    Ok(CashoutQuote {
+        requested_plur,
+        payable_plur,
+        would_bounce: payable_plur < requested_plur,
+        already_bounced: st.bounced,
+    })
+}
+
+/// Present a cheque on-chain.
+///
+/// **Must be sent by the beneficiary**: `cashChequeBeneficiary` passes
+/// `msg.sender` as the beneficiary into `_cashChequeInternal`, so the
+/// signing key here is the EOA the cheques were made out to — never the
+/// relay's, which is why this is a separate command run somewhere else
+/// (§6). `recipient` is where the BZZ lands and may differ.
+pub async fn cash_cheque(
+    beneficiary_signer: &PrivateKeySigner,
+    rpc_url: &str,
+    chain_id: u64,
+    chequebook: Address,
+    recipient: Address,
+    cumulative_plur: U256,
+    signature: &[u8; 65],
+    receipt_timeout: std::time::Duration,
+) -> Result<B256, BatchError> {
+    // The contract verifies through OpenZeppelin's ECDSA, which rejects
+    // high-s and v ∉ {27,28}. A non-canonical signature reverts and burns
+    // the gas, so refuse it here where it costs nothing.
+    crate::signer::check_canonical_signature(signature)
+        .map_err(|e| BatchError::Rpc(format!("stored cheque is not cashable: {e}")))?;
+    let rpc = EthRpc::new(rpc_url.to_string());
+    let call = cashChequeBeneficiaryCall {
+        recipient,
+        cumulativePayout: cumulative_plur,
+        issuerSig: signature.to_vec().into(),
+    }
+    .abi_encode();
+    let tx = rpc
+        .send_signed(beneficiary_signer, chain_id, chequebook, &call)
+        .await?;
+    rpc.wait_for_success(tx, receipt_timeout).await?;
+    Ok(tx)
+}
+
+#[cfg(test)]
+mod cashout_tests {
+    use super::*;
+
+    #[test]
+    fn the_cashout_selector_matches_the_contract() {
+        use alloy_sol_types::SolCall;
+        let want: [u8; 32] = <sha3::Keccak256 as sha3::Digest>::digest(
+            "cashChequeBeneficiary(address,uint256,bytes)".as_bytes(),
+        )
+        .into();
+        assert_eq!(cashChequeBeneficiaryCall::SELECTOR, want[..4]);
     }
 }

@@ -1,0 +1,279 @@
+<style>
+  /* ── Tokens ───────────────────────────────────────────────────────────
+     Palette references cheque security stock: pale safety-paper green,
+     deep engraving ink, oxblood for the hazard/cost register.            */
+  :root {
+    --ground:  #EEF2EC;
+    --surface: #F8FBF7;
+    --ink:     #14201B;
+    --ink-2:   #4C5D55;
+    --rule:    #C7D5C9;
+    --rule-2:  #DFE8DF;
+    --accent:  #0D6B58;
+    --hazard:  #8C3A2B;
+    --shadow:  0 1px 0 rgba(20,32,27,.06), 0 18px 44px -28px rgba(20,32,27,.45);
+
+    --serif: "Iowan Old Style", "Palatino Linotype", Palatino, "Book Antiqua", Georgia, serif;
+    --mono:  ui-monospace, "SF Mono", SFMono-Regular, "Cascadia Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ground:  #0C1411;
+      --surface: #121D18;
+      --ink:     #E1EAE3;
+      --ink-2:   #93A89C;
+      --rule:    #26362E;
+      --rule-2:  #1B2822;
+      --accent:  #46C2A2;
+      --hazard:  #E09A81;
+      --shadow:  0 1px 0 rgba(0,0,0,.4), 0 18px 44px -28px rgba(0,0,0,.9);
+    }
+  }
+  :root[data-theme="dark"] {
+    --ground:  #0C1411;
+    --surface: #121D18;
+    --ink:     #E1EAE3;
+    --ink-2:   #93A89C;
+    --rule:    #26362E;
+    --rule-2:  #1B2822;
+    --accent:  #46C2A2;
+    --hazard:  #E09A81;
+    --shadow:  0 1px 0 rgba(0,0,0,.4), 0 18px 44px -28px rgba(0,0,0,.9);
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--ground);
+    color: var(--ink);
+    font-family: var(--serif);
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 1.1rem;
+    padding: 1.1rem;
+  }
+
+  /* ── Stage ─────────────────────────────────────────────────────────── */
+  .stage {
+    width: min(100%, calc((100vh - 6.5rem) * 16 / 9));
+    aspect-ratio: 16 / 9;
+    position: relative;
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-radius: 3px;
+    box-shadow: var(--shadow);
+    container-type: size;
+    overflow: hidden;
+  }
+
+  .slide {
+    position: absolute;
+    inset: 0;
+    padding: 5.2cqw 6cqw 6.4cqw;
+    display: none;
+    flex-direction: column;
+    gap: calc(2.2cqh * var(--fit, 1));
+    overflow: hidden;
+  }
+  .slide.on { display: flex; }
+  /* Children must not shrink. A column flexbox squeezes its items to fit by
+     default, which makes the slide's scrollHeight equal its clientHeight even
+     when the content is visibly crushed — and the auto-fit below then
+     concludes, wrongly, that everything fits. */
+  .slide > * { flex: none; }
+
+  /* ── Slide furniture ───────────────────────────────────────────────── */
+  .eyebrow {
+    font-family: var(--mono);
+    font-size: 1.28cqw;
+    letter-spacing: .16em;
+    text-transform: uppercase;
+    color: var(--ink-2);
+    display: flex;
+    align-items: center;
+    gap: .8cqw;
+    flex: none;
+  }
+  .eyebrow::after {
+    content: "";
+    flex: 1;
+    height: 1px;
+    background: var(--rule);
+  }
+  .eyebrow b { color: var(--accent); font-weight: 600; }
+
+  .num {
+    position: absolute;
+    right: 6cqw;
+    bottom: 2.6cqw;
+    font-family: var(--mono);
+    font-size: 1.2cqw;
+    color: var(--ink-2);
+    font-variant-numeric: tabular-nums;
+  }
+
+  h1 {
+    font-size: 5.4cqw;
+    line-height: 1.02;
+    margin: 0;
+    font-weight: 600;
+    letter-spacing: -.02em;
+    text-wrap: balance;
+  }
+  h2 {
+    font-size: calc(3.1cqw * var(--fit, 1));
+    line-height: 1.1;
+    margin: 0;
+    font-weight: 600;
+    letter-spacing: -.015em;
+    text-wrap: balance;
+    flex: none;
+  }
+  h2 .q { color: var(--accent); }
+  h2 .hz { color: var(--hazard); }
+
+  .body { font-size: calc(1.82cqw * var(--fit, 1)); line-height: 1.5; }
+
+  p { margin: 0; max-width: 62ch; }
+  p + p { margin-top: calc(1.2cqh * var(--fit, 1)); }
+
+  .lede { font-size: 2.15cqw; line-height: 1.4; color: var(--ink); max-width: 54ch; }
+  .sub  { color: var(--ink-2); }
+
+  ul { margin: 0; padding-left: 1.4em; display: flex; flex-direction: column; gap: calc(1.1cqh * var(--fit, 1)); max-width: 66ch; }
+  li::marker { color: var(--accent); }
+
+  strong { font-weight: 600; }
+  em { font-style: italic; }
+
+  code, .m {
+    font-family: var(--mono);
+    font-size: .88em;
+    background: color-mix(in oklab, var(--accent) 9%, transparent);
+    padding: .08em .32em;
+    border-radius: 2px;
+  }
+
+  /* ── Callout: the load-bearing claim on a slide ────────────────────── */
+  .claim {
+    border-left: 3px solid var(--accent);
+    padding: .3cqw 0 .3cqw 1.6cqw;
+    font-size: calc(2.05cqw * var(--fit, 1));
+    line-height: 1.38;
+    max-width: 58ch;
+  }
+  .claim.hz { border-left-color: var(--hazard); }
+
+  /* ── Data ──────────────────────────────────────────────────────────── */
+  .scroll { overflow-x: auto; overflow-y: hidden; }
+  table {
+    border-collapse: collapse;
+    font-family: var(--mono);
+    font-size: calc(1.42cqw * var(--fit, 1));
+    width: 100%;
+    font-variant-numeric: tabular-nums;
+  }
+  th, td {
+    text-align: left;
+    padding: .62cqw .9cqw;
+    border-bottom: 1px solid var(--rule-2);
+    vertical-align: top;
+  }
+  th {
+    color: var(--ink-2);
+    font-weight: 400;
+    text-transform: uppercase;
+    letter-spacing: .1em;
+    font-size: calc(1.14cqw * var(--fit, 1));
+    border-bottom: 1px solid var(--rule);
+  }
+  /* md2html emits GFM column alignment as an attribute, not a class. */
+  td[align="right"], th[align="right"] { text-align: right; }
+  tr:last-child td { border-bottom: none; }
+  .ok  { color: var(--accent); }
+  .bad { color: var(--hazard); }
+
+  pre {
+    font-family: var(--mono);
+    font-size: calc(1.42cqw * var(--fit, 1));
+    line-height: 1.5;
+    margin: 0;
+    padding: 1.2cqw 1.5cqw;
+    background: color-mix(in oklab, var(--accent) 7%, transparent);
+    border-left: 2px solid var(--accent);
+    border-radius: 0 2px 2px 0;
+    overflow-x: auto;
+  }
+  pre code { background: none; padding: 0; font-size: 1em; }
+
+  /* ── Part divider slides ───────────────────────────────────────────── */
+  .part { justify-content: center; align-items: flex-start; gap: 1.4cqh; }
+  .part .kicker {
+    font-family: var(--mono);
+    font-size: 1.5cqw;
+    letter-spacing: .28em;
+    text-transform: uppercase;
+    color: var(--accent);
+  }
+  .part h2 { font-size: 6cqw; }
+
+  /* ── Title slide ───────────────────────────────────────────────────── */
+  .title { justify-content: center; gap: 2cqh; }
+  .title .rule { width: 9cqw; height: 3px; background: var(--accent); flex: none; }
+  .title .meta {
+    font-family: var(--mono);
+    font-size: 1.35cqw;
+    color: var(--ink-2);
+    line-height: 1.7;
+    letter-spacing: .02em;
+  }
+
+  .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 3cqw; align-items: start; }
+
+  /* ── Controls ──────────────────────────────────────────────────────── */
+  .bar {
+    width: min(100%, calc((100vh - 6.5rem) * 16 / 9));
+    display: flex;
+    align-items: center;
+    gap: .9rem;
+    font-family: var(--mono);
+    font-size: .74rem;
+    color: var(--ink-2);
+    letter-spacing: .08em;
+  }
+  .track { flex: 1; height: 2px; background: var(--rule); position: relative; }
+  .fill { position: absolute; inset: 0 auto 0 0; background: var(--accent); transition: width .18s ease; }
+  button {
+    font: inherit;
+    letter-spacing: inherit;
+    color: var(--ink-2);
+    background: none;
+    border: 1px solid var(--rule);
+    border-radius: 2px;
+    padding: .3rem .6rem;
+    cursor: pointer;
+  }
+  button:hover { color: var(--ink); border-color: var(--accent); }
+  button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .counter { font-variant-numeric: tabular-nums; }
+
+  @media (prefers-reduced-motion: reduce) {
+    .fill { transition: none; }
+  }
+
+  /* ── Print: one slide per page, for PDF export ─────────────────────── */
+  @media print {
+    @page { size: 297mm 167mm; margin: 0; }
+    body { display: block; padding: 0; background: #fff; }
+    .bar { display: none; }
+    .stage {
+      width: 100%; height: 100vh; border: none; box-shadow: none;
+      border-radius: 0; page-break-after: always;
+    }
+    .slide { display: flex !important; position: relative; page-break-after: always; height: 100vh; }
+  }
+</style>

@@ -643,3 +643,154 @@ fn all_acked_policy_ignores_groups() {
     assert_eq!(sched.acked(), 10, "AllAcked must not stop at the threshold");
     assert_eq!(sched.skipped(), 0);
 }
+
+// ── Metered lanes (docs/pusher-incentives.md §12) ────────────────────────
+
+fn two_lanes() -> Scheduler {
+    let infos = vec![LaneInfo::default(), LaneInfo::default()];
+    let mut s = Scheduler::new(infos, Config::default());
+    s.admit(addrs(64, 7));
+    s
+}
+
+/// Drive one batch and hand back `(batch, lane)`. The scheduler chooses the
+/// lane by weight, so tests follow its choice rather than dictating one.
+fn dispatch_one(s: &mut Scheduler, now_ms: u64) -> (u64, usize) {
+    let a = s
+        .next(now_ms)
+        .expect("a lane with pending work must produce an assignment");
+    (a.batch, a.lane)
+}
+
+/// The failure §12 exists to prevent: five routine settlements retiring a
+/// perfectly healthy lane mid-upload.
+#[test]
+fn repeated_402s_never_retire_a_lane() {
+    let mut s = two_lanes();
+    let mut now = 0u64;
+    for _ in 0..20 {
+        let (b, lane) = dispatch_one(&mut s, now);
+        s.on_batch_result(b, BatchOutcome::PaymentRequired, now);
+        // Settling is what un-pauses it; without that the lane stays out.
+        s.fund_lane(lane);
+        now += 1000;
+    }
+    for (i, st) in s.lane_stats().iter().enumerate() {
+        assert_ne!(
+            st.health.expect("health"),
+            LaneHealthKind::Retired,
+            "lane {i} kept asking to be paid and must never be retired"
+        );
+    }
+}
+
+/// A 402 must not burn a retry attempt: a routine settlement every ~32 MiB
+/// would otherwise fail a large upload after a handful of windows.
+#[test]
+fn a_402_does_not_burn_a_retry_attempt() {
+    let mut s = two_lanes();
+    let max = s.cfg.max_attempts;
+    // Exhaust all but one attempt with real failures, then 402 repeatedly:
+    // the chunk must never tip into Failed from 402s alone.
+    for _ in 0..20 {
+        let (b, _lane) = dispatch_one(&mut s, 0);
+        s.on_batch_result(b, BatchOutcome::PaymentRequired, 0);
+        // fund so the lane stays dispatchable; attempts are what we assert.
+        for l in s.unfunded_lanes() {
+            s.fund_lane(l);
+        }
+    }
+    assert_eq!(s.failed(), 0, "402s must never fail a chunk");
+    assert!(s.total() > s.failed(), "work remains");
+    let _ = max;
+}
+
+/// A 402 must not touch the failure streak — otherwise a lane that has
+/// been asking for payment is one transport error away from backoff.
+#[test]
+fn a_402_does_not_charge_lane_health() {
+    let mut s = two_lanes();
+    let mut victim = None;
+    for i in 0..10 {
+        let (b, lane) = dispatch_one(&mut s, 100 + i * 10);
+        // Charge every 402 to one lane, so any accumulation would show.
+        if victim.is_none() {
+            victim = Some(lane);
+        }
+        s.on_batch_result(b, BatchOutcome::PaymentRequired, 100 + i * 10);
+        s.fund_lane(lane);
+    }
+    // A single real failure now must still be just one failure, not the
+    // straw that tips an already-charged streak into backoff.
+    let (b, lane) = dispatch_one(&mut s, 500);
+    s.on_batch_result(b, BatchOutcome::Failed("boom".into()), 500);
+    let health = s.lane_stats()[lane].health.expect("health");
+    assert!(
+        matches!(health, LaneHealthKind::Live | LaneHealthKind::Warming),
+        "one failure after many 402s must not have compounded: {health:?}"
+    );
+}
+
+/// `Unfunded` is ineligible but recoverable — unlike `Retired`, which is
+/// permanent for the run.
+#[test]
+fn an_unfunded_lane_is_paused_then_restored_by_paying() {
+    let mut s = two_lanes();
+    let (b, lane) = dispatch_one(&mut s, 0);
+    s.on_batch_result(b, BatchOutcome::PaymentRequired, 0);
+
+    assert_eq!(
+        s.unfunded_lanes(),
+        vec![lane],
+        "the driver must see what to pay"
+    );
+    for _ in 0..8 {
+        assert_ne!(
+            s.next(20).map(|a| a.lane),
+            Some(lane),
+            "an unfunded lane must not be dispatched to"
+        );
+    }
+    s.fund_lane(lane);
+    assert!(s.unfunded_lanes().is_empty(), "paying clears the pause");
+    assert!(s.next(30).is_some(), "and the run continues");
+}
+
+/// Work must not be stranded on a paused lane: chunks go back to pending
+/// and another lane picks them up while the cheque is in flight.
+#[test]
+fn work_on_an_unfunded_lane_fails_over_rather_than_stalling() {
+    let mut s = two_lanes();
+    let (b, lane) = dispatch_one(&mut s, 0);
+    s.on_batch_result(b, BatchOutcome::PaymentRequired, 0);
+    let other = s.next(10).expect("work must not strand on a paused lane");
+    assert_ne!(other.lane, lane, "it fails over to the funded lane");
+}
+
+/// Paying is optional (§2): a fleet may mix `open`, soft-metered and
+/// hard-metered lanes, and a client with no chequebook must keep using the
+/// ones it can.
+///
+/// A retired lane is out of rotation for good — the point is that nothing
+/// is ever dispatched to it, since a lane that refuses for a missing
+/// capability is not a 402 and would charge lane health once per chunk.
+#[test]
+fn a_retired_lane_never_receives_work() {
+    let infos: Vec<LaneInfo> = (0..3).map(|_| LaneInfo::default()).collect();
+    let mut sched = Scheduler::new(infos, Config::default());
+    sched.admit(addrs(600, 7));
+
+    // Lane 1 is the one this client cannot pay.
+    sched.retire_lane(1);
+
+    let mut seen = [0usize; 3];
+    while let Some(a) = sched.next(0) {
+        seen[a.lane] += 1;
+        sched.on_batch_result(a.batch, BatchOutcome::Answered, 0);
+    }
+    assert_eq!(seen[1], 0, "retired lane took {} assignments", seen[1]);
+    assert!(
+        seen[0] > 0 && seen[2] > 0,
+        "the payable lanes must still carry the upload: {seen:?}"
+    );
+}

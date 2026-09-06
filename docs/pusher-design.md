@@ -646,7 +646,10 @@ worked without it:
 ### Deferred / watchlist
 
 - PR-sized follow-ups: `--push-quota`/`--push-challenge` hardening, P2
-  workerd port (unlocks Deno Deploy), attribution-log tooling.
+  workerd port (unlocks Deno Deploy), attribution-log tooling. Note that
+  the metered-relay design (§12) subsumes `--push-quota` outright — price
+  is a strictly better quota — and promotes `--push-challenge` from
+  optional hardening to a correctness requirement.
 - Contiguous-arc lane assignment + deep pool specialization — only if receipt
   data shows forwarding depth is a real cost (§7).
 - WS/WT bindings of the frame format — only on demonstrated need (§4).
@@ -656,7 +659,112 @@ worked without it:
   dial storage nodes directly and the pusher's raison d'être shrinks to
   constrained networks.
 
-Deferred/watchlist:
+## 12. Incentives — paying for relay
+
+Specified separately in **[`pusher-incentives.md`](./pusher-incentives.md)**
+(status: Stages 0–2 shipped — soft + hard enforcement + cashout).
+
+The problem it addresses: a relay absorbs a cost it did not incur. In a
+native upload the user's own machine is the peer bee debits for every
+chunk; put a relay in the middle and that debt moves wholesale to the
+relay, while the browser client that caused the traffic pays only postage.
+§6 books this as an accepted risk and §10 identifies the dedicated egress
+IP as the thing that is actually scarce.
+
+The design adds an optional **`metered`** relay mode (today's behaviour
+becomes `open`, and the four production lanes stay there) in which a
+client pays with off-chain SWAP cheques over the existing HTTPS channel.
+Both counterparties are hoverfly — bee is not a party, and only the
+chequebook contract and EIP-712 cheque format are borrowed, not the swap
+protocol. Payment is out-of-band (`POST /v1/pay`), the account is the
+batch-owner EOA already established by push auth, and the relay holds only
+the beneficiary *address* — never a spendable key.
+
+**The trust model is one-directional, and it drives everything else.**
+The asymmetry is **pinning, not curation** (incentives §2): a relay is a
+plain HTTP service anyone can run — there is no registry, no discovery, no
+federation roster, and `PUSHER_URLS` is one client's default fleet, not a
+membership list. A client verifies the signed quote and pins
+`(url, node_eth_address, beneficiary)` before sending a byte (or
+TOFU-trusts first-seen with a warning via `--lane-pin`); a relay gets
+whoever POSTs. So the design protects the *relay* from the *client*, and a
+client is protected by its self-computed bill, pinned price, capped
+exposure (`max_outstanding`), and measured outcomes — not by removing a
+lane from a list. An earlier revision built two-sided verification for
+this one-sided relationship and paid for it with a forgeable billing unit
+and an unbounded residual; see incentives §2.
+
+Findings from that doc that constrain this one:
+
+- **The billing unit is bytes admitted, not receipts or acks.** The client
+  cannot lie about it, because the client produced the bytes and the relay
+  counted them — no third-party attestation to forge, no chain state to
+  disagree about (incentives §8). This matters here because it settles
+  what receipt forwarding is *for*: forwarding `PushsyncReceipt` into the
+  ack is still worth doing — `PushInfo` currently drops the signature, so
+  acks are pure relay assertion, and it is the first cryptographic signal
+  a relay client has ever had — but it is **telemetry that feeds lane
+  weighting, not evidence that feeds an invoice**. A receipt signs the
+  bare chunk address (`bee/pkg/pushsync/pushsync.go:277`), so it is
+  forgeable with any throwaway key and carries no freshness; anything that
+  prices work by receipt inherits both problems.
+- **`--push-challenge` becomes mandatory under metering.** Swarm stamps
+  are public (§6), so an attacker can replay a victim's stamps at a
+  metered relay and have the work billed to the victim. The signed payload
+  must bind the relay's **origin**, not its beneficiary, and must be an
+  EIP-712 typed struct — the same account key already signs stamps and
+  cheques, so a third raw-bytes scheme over it invites confusion. And the
+  origin the relay compares against must come from **configuration, never
+  from the `Host` header** — the header is supplied by the same party
+  supplying the challenge, so checking one against the other is a no-op
+  that silently reopens the replay (incentives §11.1).
+- **"A batch owner is a costly identity" is false as stated.** The relay
+  checks batch *liveness*, and the cheapest batch the contract accepts
+  costs a fraction of a cent — so any flat per-account credit line is
+  roughly self-financing for an attacker. The fix is to scale the credit
+  line to the batch's remaining on-chain value rather than gate on it
+  (incentives §10.3). Worth knowing here because it is the same mistake
+  any future per-batch quota would make.
+- **`--push-quota` should be struck** if metered mode ships; price is a
+  strictly better quota than a volume cliff.
+- **Six live bugs in open-mode code, found during those reviews — all
+  fixed** (incentives §16). None depend on metering; they were in
+  production the whole time.
+  - *Stamp substitution via the recent-ack cache.* Dedup was keyed on
+    chunk address alone, so a hit acked a frame `ok` while silently
+    discarding the submitted stamp. Since addresses are content-derived,
+    one uploader's dust batch could shadow another's year-long batch for
+    the 120 s TTL — the victim's chunk then garbage-collected when the
+    attacker's batch expires. It also fired accidentally between honest
+    users uploading the same file. Now keyed on `(addr, batch_id)`
+    (`src/pusher.rs:286`).
+  - *Unauthenticated RPC amplification on `/v1/push`.* `resolve_owner`
+    cached only successes, unbounded, with no per-request budget, so one
+    anonymous POST naming bogus batches became up to 512 serial
+    `eth_call`s — and `EthRpc::new` built a fresh HTTP client per read.
+    Now a bounded cache with negative caching, TTLs, and an 8-lookup
+    budget, over one shared client.
+  - *No connection limit.* The accept loop spawned per connection with
+    nothing bounding it, despite §3 listing a cap as table stakes. Now a
+    256-permit semaphore acquired before `accept()`.
+  - *One transient accept error killed the relay.* `accept().await?`
+    propagated `EMFILE`/`ECONNABORTED` out of `run`. Now logged, backed
+    off, and continued.
+  - *No HTTP timeouts.* The comment claiming hyper's defaults sufficed was
+    backwards: `header_read_timeout` is inert unless a timer is installed,
+    so nothing was enforced. Now a timer plus a 30 s header timeout and a
+    120 s body timeout.
+  - *Pushsync receipt addresses were never validated* — the one that
+    matters here, because §7's whole receipt-forwarding idea rests on it.
+    `receipt.address` was neither length-checked (callers
+    `copy_from_slice` it into `[u8; 32]`, so a missized address was a
+    remote panic) nor compared to the address actually pushed (so a peer
+    could store nothing and sign for a different address deep in its own
+    neighbourhood, and `is_shallow` would call it a perfect delivery).
+    Checked at the protocol boundary now, with regression tests.
+
+### Deferred / watchlist (cont.)
+
 - Contiguous-arc lane assignment + deep pool specialization — only if receipt
   data shows forwarding depth is a real cost (§7).
 - WS/WT bindings of the frame format — only on demonstrated need (§4).

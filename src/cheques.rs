@@ -175,3 +175,144 @@ impl ChequeStore {
         Ok(())
     }
 }
+
+// ──────────────────────────────────────────────────────────────────────
+// Metered relays (docs/pusher-incentives.md §8.3)
+// ──────────────────────────────────────────────────────────────────────
+
+/// Key for a metered relay's cumulative.
+///
+/// **Namespaced by beneficiary, not by lane or overlay**, and deliberately
+/// distinct from the bare-overlay keys the bee settlement path uses.
+///
+/// A cumulative is per `(chequebook, beneficiary)` — the beneficiary is what
+/// `paidOut` is keyed on in the contract — while a *lane* is a URL. One
+/// operator running four lane URLs behind one beneficiary EOA is the obvious
+/// deployment, and keying per lane would deadlock it: lane 1 issues
+/// cumulative 10, lane 2 counts from its own zero and issues 8, the relay
+/// applies `ErrChequeNotIncreasing`, and the client recomputes 8 from the
+/// same local counter forever. Two lanes sharing a beneficiary collapse to
+/// one key here, which is exactly right — they are one settlement channel.
+///
+/// The overlay key stays correct for bee peers, where the overlay *is* the
+/// stable cross-run identity, so the two namespaces coexist without a
+/// migration.
+pub fn relay_key(beneficiary: &[u8; 20]) -> String {
+    format!("relay:{}", hex::encode(beneficiary))
+}
+
+impl ChequeStore {
+    /// Everything promised against this chequebook, across every payee.
+    ///
+    /// Lanes with distinct beneficiaries are independent claims on **one**
+    /// balance, so without this a cheque to the second lane silently
+    /// exceeds it and bounces. Mirrors bee's `reserveTotalIssued`
+    /// (`chequebook.go:163-178`) on the issuing side.
+    pub fn total_issued(&self) -> u128 {
+        self.payouts
+            .values()
+            .copied()
+            .fold(0u128, u128::saturating_add)
+    }
+
+    /// Would raising `key` to `cumulative` push the total past `balance`?
+    ///
+    /// Checked *before* signing: an over-committed cheque is not refused by
+    /// the relay, it is accepted and then fails at cashout, which looks like
+    /// the relay's fault and costs the lane's trust rather than the
+    /// client's.
+    pub fn would_exceed_balance(&self, key: &str, cumulative: u128, balance: u128) -> bool {
+        let others = self.total_issued().saturating_sub(self.cumulative(key));
+        others.saturating_add(cumulative) > balance
+    }
+
+    /// Set an absolute cumulative, for payees where the client computes the
+    /// running total itself (metered relays) rather than accruing deltas.
+    /// Refuses to move backwards — that would produce a cheque the payee
+    /// rejects as non-increasing.
+    pub fn set_cumulative(&mut self, key: &str, cumulative: u128) -> Result<(), ChequeStoreError> {
+        let k = key.to_lowercase();
+        let cur = self.payouts.get(&k).copied().unwrap_or(0);
+        if cumulative < cur {
+            return Err(ChequeStoreError::Overflow);
+        }
+        self.payouts.insert(k, cumulative);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod metered_tests {
+    use super::*;
+
+    const CB: [u8; 20] = [1u8; 20];
+    const BEN_A: [u8; 20] = [0xAA; 20];
+    const BEN_B: [u8; 20] = [0xBB; 20];
+
+    /// The deployment that would otherwise deadlock: several lane URLs, one
+    /// beneficiary. They must share a single running cumulative.
+    #[test]
+    fn two_lanes_behind_one_beneficiary_share_a_cumulative() {
+        let mut s = ChequeStore::new(CB);
+        let k = relay_key(&BEN_A);
+        s.set_cumulative(&k, 1000).expect("lane 1 settles");
+        // Lane 2, same operator, same beneficiary — must continue from 1000
+        // rather than starting over at its own zero.
+        assert_eq!(s.cumulative(&k), 1000);
+        s.set_cumulative(&k, 1600).expect("lane 2 settles");
+        assert_eq!(s.cumulative(&k), 1600);
+    }
+
+    #[test]
+    fn a_cumulative_never_moves_backwards() {
+        let mut s = ChequeStore::new(CB);
+        let k = relay_key(&BEN_A);
+        s.set_cumulative(&k, 500).expect("set");
+        s.set_cumulative(&k, 400)
+            .expect_err("a lower cumulative would be rejected as non-increasing");
+        assert_eq!(s.cumulative(&k), 500);
+    }
+
+    /// Distinct beneficiaries are distinct channels but one balance.
+    #[test]
+    fn total_issued_sums_every_payee() {
+        let mut s = ChequeStore::new(CB);
+        s.set_cumulative(&relay_key(&BEN_A), 600).expect("a");
+        s.set_cumulative(&relay_key(&BEN_B), 300).expect("b");
+        // A bee peer drawing on the same chequebook counts too.
+        s.bump_and_get("abc123", 100).expect("bee peer");
+        assert_eq!(s.total_issued(), 1000);
+    }
+
+    #[test]
+    fn over_committing_the_balance_is_caught_before_signing() {
+        let mut s = ChequeStore::new(CB);
+        s.set_cumulative(&relay_key(&BEN_A), 600).expect("a");
+        s.set_cumulative(&relay_key(&BEN_B), 300).expect("b");
+        let k = relay_key(&BEN_A);
+        assert!(
+            !s.would_exceed_balance(&k, 700, 1000),
+            "raising A to 700 alongside B's 300 exactly fits"
+        );
+        assert!(
+            s.would_exceed_balance(&k, 701, 1000),
+            "one PLUR more does not"
+        );
+    }
+
+    /// Relay and bee keys must not collide: an overlay is 32 bytes of hex
+    /// and a beneficiary is 20, but the namespace makes it explicit rather
+    /// than incidental.
+    #[test]
+    fn relay_keys_are_namespaced_away_from_bee_overlays() {
+        let k = relay_key(&BEN_A);
+        assert!(k.starts_with("relay:"));
+        let mut s = ChequeStore::new(CB);
+        s.set_cumulative(&k, 42).expect("relay");
+        assert_eq!(
+            s.cumulative(&hex::encode(BEN_A)),
+            0,
+            "a bare-hex key must not read the relay's entry"
+        );
+    }
+}

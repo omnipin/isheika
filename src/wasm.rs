@@ -1139,8 +1139,18 @@ impl UploadSession {
     /// Feed a lane's `/v1/status` JSON. Per lane and idempotent: a relay
     /// that is asleep when polled simply keeps its default priors instead
     /// of degrading routing for every other lane.
+    ///
+    /// Returns `false` when the lane was taken out of rotation instead of
+    /// scheduled — today that means it enforces payment
+    /// (`docs/pusher-incentives.md` §7.3) and this build has no way to pay.
+    /// The browser stamps but never settles: the chequebook lives in the
+    /// native client, so a hard lane would answer every POST with 401 for a
+    /// missing capability, and that is not a 402 — it counts against lane
+    /// health and burns one attempt per chunk rediscovering something the
+    /// lane announced up front. Soft-metered lanes are kept, since those
+    /// bill and serve; an unpaying client is served exactly like on `open`.
     #[wasm_bindgen(js_name = "setLaneStatus")]
-    pub fn set_lane_status(&mut self, lane: usize, status: JsValue) -> Result<(), JsError> {
+    pub fn set_lane_status(&mut self, lane: usize, status: JsValue) -> Result<bool, JsError> {
         // Round-trip through JSON text rather than pulling in
         // serde-wasm-bindgen for one struct.
         let txt = js_sys::JSON::stringify(&status)
@@ -1152,6 +1162,21 @@ impl UploadSession {
             .and_then(|s| s.as_str())
             .and_then(|s| hex::decode(s.trim_start_matches("0x")).ok())
             .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok());
+        // The advertised `enforcement` is read without verifying the quote's
+        // signature, unlike the native path. Verification protects a *payer*
+        // from being overcharged; there is no payment here to protect, and
+        // the only thing this flag can do is make us decline a lane. A lane
+        // lying its way out of our traffic is a lane denying its own
+        // service.
+        let payment = v.get("payment");
+        let hard_enforcement = payment
+            .and_then(|p| p.get("enforcement"))
+            .and_then(|x| x.as_str())
+            == Some("hard");
+        let price_plur_per_kib = payment
+            .and_then(|p| p.get("price_plur_per_kib"))
+            .and_then(|x| x.as_str())
+            .and_then(|s| s.parse::<u128>().ok());
         self.sched.set_lane_info(
             lane,
             crate::pushsched::LaneInfo {
@@ -1170,9 +1195,15 @@ impl UploadSession {
                     .and_then(|p| p.get("live"))
                     .and_then(|x| x.as_u64())
                     .map(|x| x as usize),
+                price_plur_per_kib,
+                hard_enforcement,
             },
         );
-        Ok(())
+        if hard_enforcement {
+            self.sched.retire_lane(lane);
+            return Ok(false);
+        }
+        Ok(true)
     }
 
     /// Next POST to issue, or `undefined` if nothing is dispatchable right
@@ -1240,6 +1271,22 @@ impl UploadSession {
             .on_batch_timing(lane, acked, elapsed_ms.max(0.0) as u64);
         self.sched
             .on_batch_result(batch as u64, outcome, now_ms.max(0.0) as u64);
+    }
+
+    /// A 402/401 is a bill (or stale capability), not a fault — pause the
+    /// lane without charging health or burning a retry attempt. The browser
+    /// has no chequebook, so a hard lane that flips mid-run pauses rather
+    /// than failing its chunks; hard lanes are still retired upfront via
+    /// `setLaneStatus`, this is the mid-run recovery.
+    #[wasm_bindgen(js_name = "reportPaymentRequired")]
+    pub fn report_payment_required(&mut self, batch: f64, _lane: usize, now_ms: f64) {
+        // `_lane` is for JS call-site symmetry with `reportBatch`; the
+        // scheduler resolves the lane from the batch id.
+        self.sched.on_batch_result(
+            batch as u64,
+            crate::pushsched::BatchOutcome::PaymentRequired,
+            now_ms.max(0.0) as u64,
+        );
     }
 
     /// Milliseconds to wait before calling `nextRequest` again when it

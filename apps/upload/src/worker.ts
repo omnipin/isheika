@@ -64,14 +64,20 @@ interface UploadSession {
   readonly failed: number
   readonly hedges: number
   readonly done: boolean
-  /** Feed a lane's /v1/status JSON (pool size, batch_max, budget, overlay). */
-  setLaneStatus: (lane: number, status: unknown) => void
+  /**
+   * Feed a lane's /v1/status JSON (pool size, batch_max, budget, overlay).
+   * False when the lane was retired instead of scheduled — it enforces
+   * payment and this build has no chequebook.
+   */
+  setLaneStatus: (lane: number, status: unknown) => boolean
   /** Next POST to issue, or undefined if nothing is dispatchable now. */
   nextRequest: (nowMs: number) => PushRequest | undefined
   /** One streamed NDJSON ack. Idempotent per address (hedges rely on this). */
   reportAck: (lane: number, addrHex: string, ok: boolean, nowMs: number) => void
   /** HTTP-level result of a dispatch, after all of its acks. */
   reportBatch: (batch: number, lane: number, acked: number, elapsedMs: number, ok: boolean, nowMs: number) => void
+  /** 402/401: pause the lane without charging health or burning retries. */
+  reportPaymentRequired?: (batch: number, lane: number, nowMs: number) => void
   /** How long to wait before retrying nextRequest (0 = wait on in-flight). */
   waitMs: (nowMs: number) => number
   /** Non-empty when the run cannot proceed (all lanes gone / attempts spent). */
@@ -329,6 +335,7 @@ async function postDispatch (
       }
     } catch { /* skip non-JSON */ }
   }
+  let paymentRequired = false
   try {
     const resp = await fetch(pushUrl, {
       method: 'POST',
@@ -338,6 +345,10 @@ async function postDispatch (
     if (!resp.ok) {
       const t = (await resp.text().catch(() => '')).slice(0, 300)
       log(`Pusher ${pushUrl} → HTTP ${resp.status}: ${t}`)
+      // A 402 is a bill and a 401 a stale capability — neither is a fault.
+      // Pause the lane (no health charge, no retry burn); hard lanes are
+      // retired upfront, so this is the mid-run soft→hard flip path.
+      if (resp.status === 402 || resp.status === 401) paymentRequired = true
     } else {
       ok = true
       const reader = resp.body?.getReader()
@@ -360,7 +371,12 @@ async function postDispatch (
     log(`Pusher ${pushUrl} fetch failed: ${e instanceof Error ? e.message : String(e)}`)
   }
   // `ok` is the HTTP-level verdict; per-chunk outcomes were already reported.
-  session.reportBatch(batch, lane, acked, Date.now() - t0, ok, Date.now())
+  // 402/401 pauses via the dedicated path so chunks keep their attempts.
+  if (paymentRequired && session.reportPaymentRequired != null) {
+    session.reportPaymentRequired(batch, lane, Date.now())
+  } else {
+    session.reportBatch(batch, lane, acked, Date.now() - t0, ok && !paymentRequired, Date.now())
+  }
 }
 
 /**
@@ -375,10 +391,23 @@ async function pushSession (session: UploadSession, lanes: string[]): Promise<st
   // Warm the scheduler with each lane's advertisement (pool size, batch_max,
   // budget) before the first dispatch, so weights start from measurements
   // rather than priors. Lanes that don't answer are simply left on defaults.
+  //
+  // `setLaneStatus` returns false for a lane it retired rather than
+  // scheduled — a relay that *enforces* payment, which this build cannot
+  // make (the chequebook lives in the native client; the browser only
+  // stamps). Paying is optional across the fleet, so free, soft-metered and
+  // hard lanes can all sit in PUSHER_URLS and each client uses the subset it
+  // can actually be served by.
+  let usable = 0
   await Promise.all(lanes.map(async (u, i) => {
     const st = await fetchLaneStatus(u)
-    if (st !== undefined) session.setLaneStatus(i, st)
+    if (st === undefined) { usable++; return } // asleep, not refusing — keep it
+    if (session.setLaneStatus(i, st)) usable++
+    else log(`Pusher ${u} requires payment; skipping it (browser uploads are unpaid).`)
   }))
+  if (usable === 0) {
+    throw new Error('every relay in PUSHER_URLS requires payment — the browser cannot pay')
+  }
 
   const pushUrls = lanes.map(u => `${u.replace(/\/+$/, '')}/v1/push`)
   let lastPost = 0

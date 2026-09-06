@@ -68,6 +68,32 @@ pub mod daemon;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod inbound;
 
+// The incentive layer has two halves, and only one of them is the relay.
+// `pusher` is the relay feature — it exists to pull in hyper. A *client*
+// paying a metered relay needs the challenge wire format, the pricing
+// arithmetic and the payer, but no server: gating those behind `pusher`
+// made `--no-default-features --features cli` fail to build, because
+// `client.rs` reaches for them unconditionally on every relay push.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod challenge;
+
+#[cfg(not(target_arch = "wasm32"))]
+pub mod meter;
+
+#[cfg(not(target_arch = "wasm32"))]
+pub mod payer;
+
+// Relay-side only, and genuinely so: these hold the ledger the relay bills
+// against and the state machine that defends it.
+#[cfg(all(feature = "pusher", not(target_arch = "wasm32")))]
+pub mod inbound_limit;
+
+#[cfg(all(feature = "pusher", not(target_arch = "wasm32")))]
+pub mod ledger;
+
+#[cfg(all(feature = "pusher", not(target_arch = "wasm32")))]
+pub mod metered;
+
 #[cfg(all(feature = "pusher", not(target_arch = "wasm32")))]
 pub mod pusher;
 

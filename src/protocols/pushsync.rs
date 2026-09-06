@@ -121,10 +121,143 @@ where
     if !receipt.err.is_empty() {
         return Err(PushsyncError::Peer(receipt.err));
     }
+    // The receipt must be *for the chunk we pushed*. Two things go wrong
+    // without this check, and both are reachable by any peer in the pool
+    // (membership comes from hive gossip and the seed list, so it is not a
+    // trusted set):
+    //
+    // 1. `address` is copied straight off the wire, and callers build a
+    //    `[u8; 32]` from it with `copy_from_slice` (`src/client.rs:5380`,
+    //    `:5398`), which panics on any other length. A 0- or 33-byte
+    //    address is a remote panic that unwinds the push task.
+    // 2. Nothing else compares it to what we sent. A peer could accept the
+    //    Delivery, store nothing, and sign a receipt for some *other*
+    //    address deep inside its own neighborhood: `is_shallow` and the
+    //    `po` computation both read `r.address`, so the forged receipt
+    //    looks like a perfect deep delivery and the chunk is acked `ok`
+    //    having never been stored.
+    //
+    // Checking it here means every `PushsyncReceipt` in the codebase
+    // carries exactly the 32-byte address that was pushed.
+    if receipt.address != address[..] {
+        return Err(PushsyncError::Peer(format!(
+            "receipt address mismatch: pushed {}, receipt {}",
+            hex::encode(address),
+            hex::encode(&receipt.address),
+        )));
+    }
     Ok(PushsyncReceipt {
         address: receipt.address,
         signature: receipt.signature,
         nonce: receipt.nonce,
         storage_radius: receipt.storage_radius,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use prost::Message;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    /// Stream whose read side replays a canned peer response and whose
+    /// write side is discarded — enough to drive `push` to the receipt.
+    struct Canned {
+        read: Vec<u8>,
+        pos: usize,
+    }
+
+    impl futures::AsyncRead for Canned {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut [u8],
+        ) -> Poll<std::io::Result<usize>> {
+            let n = (self.read.len() - self.pos).min(buf.len());
+            buf[..n].copy_from_slice(&self.read[self.pos..self.pos + n]);
+            self.pos += n;
+            Poll::Ready(Ok(n))
+        }
+    }
+
+    impl futures::AsyncWrite for Canned {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Response headers followed by `receipt`, both length-delimited.
+    fn peer_saying(receipt: pb::Receipt) -> Canned {
+        let mut read = Vec::new();
+        hdr::Headers { headers: vec![] }
+            .encode_length_delimited(&mut read)
+            .expect("encode headers");
+        receipt
+            .encode_length_delimited(&mut read)
+            .expect("encode receipt");
+        Canned { read, pos: 0 }
+    }
+
+    fn receipt_for(address: Vec<u8>) -> pb::Receipt {
+        pb::Receipt {
+            address,
+            signature: vec![7u8; 65],
+            nonce: vec![9u8; 32],
+            err: String::new(),
+            storage_radius: 8,
+        }
+    }
+
+    fn push_against(receipt: pb::Receipt) -> Result<PushsyncReceipt, PushsyncError> {
+        let pushed = [1u8; 32];
+        let mut stream = peer_saying(receipt);
+        tokio_test::block_on(push(&mut stream, &pushed, &[0u8; 16], &[0u8; 113]))
+    }
+
+    #[test]
+    fn receipt_for_the_pushed_address_is_accepted() {
+        let r = push_against(receipt_for(vec![1u8; 32])).expect("should accept");
+        assert_eq!(r.address, vec![1u8; 32]);
+        assert_eq!(r.storage_radius, 8);
+    }
+
+    /// A peer can otherwise sign a receipt for a *different* address deep in
+    /// its own neighborhood, having stored nothing: `is_shallow` and the `po`
+    /// computation both read the receipt's address, so it would look like a
+    /// perfect delivery.
+    #[test]
+    fn receipt_for_a_different_address_is_rejected() {
+        let err = push_against(receipt_for(vec![2u8; 32])).expect_err("should reject");
+        assert!(
+            matches!(&err, PushsyncError::Peer(m) if m.contains("address mismatch")),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Callers build `[u8; 32]` from this with `copy_from_slice`, which
+    /// panics on any other length — so a malformed address must be rejected
+    /// here rather than unwinding the push task.
+    #[test]
+    fn missized_addresses_are_rejected_not_panicked_on() {
+        for bad in [vec![], vec![1u8; 31], vec![1u8; 33], vec![1u8; 64]] {
+            let n = bad.len();
+            let err =
+                push_against(receipt_for(bad)).expect_err("missized address must be rejected");
+            assert!(
+                matches!(&err, PushsyncError::Peer(m) if m.contains("address mismatch")),
+                "unexpected error for {n}-byte address: {err}"
+            );
+        }
+    }
 }

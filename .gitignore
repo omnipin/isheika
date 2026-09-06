@@ -6,6 +6,17 @@ peers.json
 # Overlay identity nonce written to CWD by CLI runs (default `--nonce-file`).
 # A runtime artifact, like peers.json — never commit it.
 overlay-nonce
+# Cumulative payouts issued to bee peers and metered relays, written to CWD
+# by paid uploads. Runtime money state: committing it would publish who was
+# paid what, and restoring a stale copy re-issues cheques the counterparty
+# has already banked.
+cheques.json
+# Agent-local tool config. `settings.local.json` itself is usually covered by
+# a global ignore, but the editor writes `*.tmp.<pid>.<hash>` siblings that
+# such a pattern misses — and those files quote whole shell commands, so a
+# `git add -A` mid-session can publish a key that was passed on a command
+# line. Ignore the whole directory.
+.claude/
 # `peers.seed.json` is checked in: an IP-diverse cold-start seed
 # harvested from a long-running daemon (~800 peers across ~800 unique
 # /32 IPs as of the last refresh; regenerate via

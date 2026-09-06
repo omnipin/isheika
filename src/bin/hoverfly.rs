@@ -140,8 +140,17 @@ struct Cli {
     /// for Sepolia testnet. The chain id is part of the domain
     /// separator that bee's chequestore verifies against, so a
     /// mismatch silently invalidates every cheque we send.
+    /// Metered lanes are also checked against this: a quote naming a
+    /// different chain is refused rather than signed for.
     #[arg(long, global = true, default_value_t = 100, value_name = "ID")]
     chequebook_chain_id: u64,
+
+    /// Pin a metered lane's identity: `URL,NODE,BENEFICIARY` (0x-hex).
+    /// Repeatable. Without a pin the first-seen quote is trusted for the
+    /// run (TOFU) with a warning — any host answering the URL could mint
+    /// its own quote and be paid. Stable fleets should pin.
+    #[arg(long, global = true, value_name = "URL,NODE,BENEFICIARY")]
+    lane_pin: Vec<String>,
 
     /// Path to the 32-byte overlay nonce file. The Swarm overlay is
     /// derived as `keccak256(eth_addr || network_id || nonce)`, so a
@@ -507,6 +516,70 @@ enum Commands {
             value_name = "URL"
         )]
         rpc_url: String,
+
+        // ── Metered mode (docs/pusher-incentives.md Stage 1) ──────────
+        /// Bill clients for relayed bytes with off-chain SWAP cheques.
+        /// Off by default: `open` is today's unmetered behaviour and is
+        /// what the production lanes run.
+        #[arg(long)]
+        meter: bool,
+
+        /// Hostname(s) this relay is reached at. **Required with
+        /// `--meter`.** The admission challenge binds the origin a client
+        /// dialled, and the relay compares it against *this* value — never
+        /// against the `Host` header, which the same client supplies and
+        /// which would make the check a no-op that silently reopens
+        /// cross-relay replay.
+        #[arg(long, value_name = "HOST")]
+        origin: Vec<String>,
+
+        /// EOA that cheques are made out to. The relay holds this address
+        /// only, never the key: cashing out happens elsewhere.
+        #[arg(long, value_name = "0xADDR")]
+        beneficiary: Option<String>,
+
+        /// Settlement chain. Pins the EIP-712 domain and selects the
+        /// hardcoded SimpleSwapFactory; a chain with no vetted factory
+        /// cannot run metered.
+        #[arg(long, default_value_t = 100, value_name = "ID")]
+        chequebook_chain: u64,
+
+        /// Directory for the ledger and relay secret. **Required with
+        /// `--meter`**: without durable state a client re-presents its
+        /// last cheque after every restart and is credited the full
+        /// cumulative again, which is unlimited free service from one
+        /// signature.
+        #[arg(long, value_name = "DIR")]
+        state_dir: Option<std::path::PathBuf>,
+
+        /// PLUR per KiB of body admitted.
+        #[arg(long, value_name = "PLUR")]
+        price_plur_per_kib: Option<u128>,
+
+        /// Smallest cheque accepted, to bound RPC cost per unit of value.
+        #[arg(long, value_name = "PLUR")]
+        min_cheque_plur: Option<u128>,
+
+        /// Debt at which a client is expected to settle.
+        #[arg(long, value_name = "PLUR")]
+        settle_every_plur: Option<u128>,
+
+        /// Global ceiling on a credit line. The actual cap is per batch:
+        /// `min(batch_remaining_value / credit_ratio, this)`.
+        #[arg(long, value_name = "PLUR")]
+        max_outstanding_plur: Option<u128>,
+
+        /// Credit line = batch remaining on-chain value ÷ this. The Sybil
+        /// margin is this ratio by construction, independent of batch size.
+        #[arg(long, value_name = "N")]
+        credit_ratio: Option<u128>,
+
+        /// Enforce 402 when an account is over its cap. Default is soft
+        /// mode: meter, report, and serve anyway — which is what Stage 1
+        /// ships, so the overshoot rate can be measured against live
+        /// traffic before anyone is refused.
+        #[arg(long)]
+        meter_hard: bool,
     },
 
     /// Run a long-lived daemon that holds a warm session pool across
@@ -738,6 +811,76 @@ enum Commands {
         action: BatchAction,
     },
 
+    /// Cash cheques a metered relay has accepted.
+    ///
+    /// Reads the relay's ledger, prices each held cheque on-chain, and
+    /// presents the ones worth collecting. **Run this somewhere other than
+    /// the relay**: `cashChequeBeneficiary` must be sent *by* the
+    /// beneficiary, so it needs the beneficiary's private key — which is
+    /// exactly the key a relay box is designed never to hold. Copy the
+    /// relay's state directory (it contains `ledger.json`), or point
+    /// `--state-dir` at a snapshot copy of that directory, and run this
+    /// from a machine that does.
+    ///
+    /// A cheque is cumulative, so only the newest one per chequebook is
+    /// ever presented; gas is paid once per chequebook, not once per
+    /// cheque received.
+    ///
+    /// Behind the `pusher` feature because it reads the *relay's* ledger:
+    /// without a relay there are no cheques to cash. (Ideally this would
+    /// be `#[cfg(unix)]` with only `ledger` ungated — a cashout box needs
+    /// no hyper server — but `ledger` currently shares the `pusher` gate,
+    /// so cashing requires it for now.)
+    #[cfg(all(unix, feature = "pusher"))]
+    Cashout {
+        #[arg(
+            long,
+            default_value = "https://rpc.gnosischain.com",
+            value_name = "URL"
+        )]
+        rpc_url: String,
+        /// The **beneficiary's** private key — the EOA cheques were made
+        /// out to, and the only address the contract will pay.
+        #[arg(long, value_name = "KEY")]
+        key: String,
+        /// Relay state directory containing `ledger.json`.
+        #[arg(long, value_name = "DIR")]
+        state_dir: std::path::PathBuf,
+        /// Where the BZZ should land. Defaults to the beneficiary.
+        #[arg(long, value_name = "ADDR")]
+        recipient: Option<String>,
+        /// Skip cheques worth less than this in BZZ. Measured cashouts use
+        /// ~75-110k gas at ~1e-10 xDAI, so any non-zero cheque repays its
+        /// gas; this threshold is a batching convenience — how much value
+        /// to let accumulate before spending an RPC round trip and a
+        /// pending transaction — not a break-even (§9.3).
+        #[arg(long, default_value = "0.25", value_name = "BZZ")]
+        min_amount: String,
+        /// Only one chequebook, rather than everything in the ledger.
+        #[arg(long, value_name = "ADDR")]
+        chequebook: Option<String>,
+        /// Price everything and print it, sending nothing.
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long, default_value_t = 100, value_name = "ID")]
+        chain_id: u64,
+        #[arg(long, default_value_t = 300, value_name = "SECS")]
+        timeout: u64,
+    },
+
+    /// Manage a SWAP chequebook — the contract that pays metered pusher
+    /// relays (`docs/pusher-incentives.md`).
+    ///
+    /// Deliberately its own command rather than something an upload does
+    /// for you: deploying a contract is irreversible and spends real funds,
+    /// and an upload that deployed one silently because a lane quoted a
+    /// price would fire before you had decided you wanted to pay at all.
+    #[cfg(unix)]
+    Chequebook {
+        #[command(subcommand)]
+        action: ChequebookAction,
+    },
+
     /// Bridge funds from another chain to xDAI + BZZ on Gnosis via Relay.
     ///
     /// Solves the setup chicken-and-egg: `batch create` needs the signer's
@@ -837,6 +980,78 @@ enum Commands {
 }
 
 #[cfg(unix)]
+#[derive(Subcommand)]
+enum ChequebookAction {
+    /// Deploy a chequebook through bee's canonical SimpleSwapFactory.
+    ///
+    /// The issuer is `--key`'s address, and it must be the **batch owner**:
+    /// a metered relay only accepts a cheque whose chequebook `issuer()`
+    /// equals the account it billed. The issuer is also the only address
+    /// that can ever `withdraw()`, so never deploy with a key you do not
+    /// exclusively control.
+    ///
+    /// Deploys with a hard-deposit timeout of 0, matching every bee
+    /// chequebook. Deposits are therefore not locked; see §11.2.
+    Deploy {
+        #[arg(
+            long,
+            default_value = "https://rpc.gnosischain.com",
+            value_name = "URL"
+        )]
+        rpc_url: String,
+        /// Private key (hex, 32 bytes). Its address becomes the issuer.
+        #[arg(long, value_name = "KEY")]
+        key: String,
+        #[arg(long, default_value_t = 100, value_name = "ID")]
+        chain_id: u64,
+        /// Seconds to wait for the deploy receipt.
+        #[arg(long, default_value_t = 300, value_name = "SECS")]
+        timeout: u64,
+    },
+    /// Deposit BZZ into an existing chequebook.
+    ///
+    /// Separate from `deploy` so topping up later does not mean pretending
+    /// to redeploy. Refuses to send to an address that does not answer
+    /// `issuer()`, or whose issuer is not `--key` — only the issuer can
+    /// withdraw, so funding someone else's chequebook strands the deposit.
+    Fund {
+        #[arg(
+            long,
+            default_value = "https://rpc.gnosischain.com",
+            value_name = "URL"
+        )]
+        rpc_url: String,
+        #[arg(long, value_name = "KEY")]
+        key: String,
+        #[arg(long, value_name = "ADDR")]
+        chequebook: String,
+        /// BZZ to deposit (decimal, e.g. `0.05`). BZZ has 16 decimals.
+        #[arg(long, value_name = "BZZ")]
+        amount: String,
+        #[arg(long, default_value_t = 100, value_name = "ID")]
+        chain_id: u64,
+        #[arg(long, default_value_t = 300, value_name = "SECS")]
+        timeout: u64,
+    },
+    /// Print a chequebook's on-chain state: issuer, balance liquid to a
+    /// given beneficiary, what it has already paid out, and whether it has
+    /// ever bounced.
+    Status {
+        #[arg(
+            long,
+            default_value = "https://rpc.gnosischain.com",
+            value_name = "URL"
+        )]
+        rpc_url: String,
+        #[arg(long, value_name = "ADDR")]
+        chequebook: String,
+        /// Beneficiary to report liquidity for. Defaults to the zero
+        /// address, which reports the plain liquid balance.
+        #[arg(long, value_name = "ADDR")]
+        beneficiary: Option<String>,
+    },
+}
+
 #[derive(Subcommand)]
 enum BatchAction {
     /// Create a new postage stamp batch on-chain.
@@ -1157,6 +1372,37 @@ fn parse_address_hex(s: &str) -> Result<[u8; 20], String> {
     let bytes = hex::decode(trimmed).map_err(|e| format!("bad hex: {e}"))?;
     let mut out = [0u8; 20];
     out.copy_from_slice(&bytes);
+    Ok(out)
+}
+
+/// Parse `--lane-pin URL,NODE,BENEFICIARY` entries into URL → pin.
+fn parse_lane_pins(
+    raw: &[String],
+) -> Result<std::collections::HashMap<String, hoverfly::payer::LanePin>, String> {
+    let mut out = std::collections::HashMap::new();
+    for entry in raw {
+        let parts: Vec<&str> = entry.split(',').collect();
+        if parts.len() != 3 {
+            return Err(format!(
+                "--lane-pin must be URL,NODE,BENEFICIARY (0x-hex), got {entry:?}"
+            ));
+        }
+        let url = parts[0].trim().trim_end_matches('/').to_string();
+        if url.is_empty() {
+            return Err(format!("--lane-pin has empty URL in {entry:?}"));
+        }
+        let node =
+            parse_address_hex(parts[1].trim()).map_err(|e| format!("--lane-pin node: {e}"))?;
+        let beneficiary = parse_address_hex(parts[2].trim())
+            .map_err(|e| format!("--lane-pin beneficiary: {e}"))?;
+        out.insert(
+            url,
+            hoverfly::payer::LanePin {
+                node_eth_address: node,
+                beneficiary,
+            },
+        );
+    }
     Ok(out)
 }
 
@@ -1782,9 +2028,97 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 };
                 let n_chunks = streamer.total_chunks();
                 let progress = make_progress_bar();
-                let root =
-                    hoverfly::client::push_stream_via_pushers(&pusher, streamer, progress.as_ref())
-                        .await?;
+                // Metered lanes: pay only when the user has explicitly given
+                // a chequebook. Without one we push exactly as before and a
+                // metered lane simply meters us in soft mode — nothing here
+                // deploys or funds anything on its own.
+                let pay_cfg = match cli.chequebook.as_ref() {
+                    Some(cb_hex) => {
+                        let cb =
+                            parse_address_hex(cb_hex).map_err(|e| format!("--chequebook: {e}"))?;
+                        let pins = parse_lane_pins(&cli.lane_pin)?;
+                        // The relay checks funding against `liquidBalanceFor`
+                        // at accept time; we check total issuance against the
+                        // total liquid before signing, so we never hand over a
+                        // cheque that cannot be cashed. Read with ZERO
+                        // beneficiary: `liquidBalanceFor(0x0)` is the total
+                        // liquid (no hard deposit for zero), i.e. the global
+                        // ceiling across all lanes — not any lane's figure.
+                        // `issuer` is beneficiary-independent, so this also
+                        // fail-fasts a chequebook/sign-key mismatch that would
+                        // otherwise surface mid-upload as 403/400 after
+                        // stamping.
+                        let (balance_plur, issuer_ok) =
+                            match hoverfly::batch::read_chequebook_state(
+                                &rpc_url,
+                                alloy_primitives::Address::from(cb),
+                                alloy_primitives::Address::ZERO,
+                            )
+                            .await
+                            {
+                                Ok(st) => {
+                                    let issuer: [u8; 20] = st.issuer.into_array();
+                                    if issuer != *signer.eth_address() {
+                                        return Err(format!(
+                                        "--chequebook issuer 0x{} != signing key 0x{}: only the issuer can pay (relay enforces issuer==account)",
+                                        hex::encode(issuer),
+                                        hex::encode(signer.eth_address())
+                                    )
+                                    .into());
+                                    }
+                                    eprintln!(
+                                        "metered: chequebook=0x{} issuer=0x{} total_liquid={} PLUR chain={}",
+                                        hex::encode(cb),
+                                        hex::encode(issuer),
+                                        st.liquid_for_us,
+                                        cli.chequebook_chain_id,
+                                    );
+                                    (u128::try_from(st.liquid_for_us).unwrap_or(u128::MAX), true)
+                                }
+                                Err(e) => {
+                                    // Soft-fail: an RPC outage must not abort an
+                                    // upload whose lanes are all open/soft and
+                                    // would serve unpaid. Per-lane relay checks
+                                    // still enforce funding at accept time.
+                                    eprintln!(
+                                        "metered: chequebook state unreadable ({e}); continuing with no global balance pre-check"
+                                    );
+                                    (u128::MAX, false)
+                                }
+                            };
+                        let _ = issuer_ok;
+                        let store = hoverfly::cheques::ChequeStore::load_or_create(
+                            &cli.cheques_file,
+                            cb,
+                        )
+                        .map_err(|e| format!("loading {}: {e}", cli.cheques_file.display()))?;
+                        // `batch` is the hex string the user passed; the
+                        // challenge binds the raw 32 bytes.
+                        let batch_raw = hex::decode(batch.trim_start_matches("0x"))
+                            .map_err(|e| format!("--batch: {e}"))?;
+                        let batch_id: [u8; 32] = batch_raw
+                            .as_slice()
+                            .try_into()
+                            .map_err(|_| "--batch must be 32 bytes".to_string())?;
+                        Some(hoverfly::payer::PaymentConfig {
+                            signer: signer.clone(),
+                            batch: batch_id,
+                            chequebook: cb,
+                            chain_id: cli.chequebook_chain_id,
+                            cheques: std::sync::Arc::new(std::sync::Mutex::new(store)),
+                            balance_plur,
+                            pins,
+                        })
+                    }
+                    None => None,
+                };
+                let root = hoverfly::client::push_stream_via_pushers_paid(
+                    &pusher,
+                    streamer,
+                    progress.as_ref(),
+                    pay_cfg.as_ref(),
+                )
+                .await?;
                 drop(progress);
                 let elapsed = upload_started.elapsed();
                 let root_hex = hex::encode(root.as_bytes());
@@ -2063,6 +2397,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             peerlist,
             probe,
             rpc_url,
+            meter,
+            origin,
+            beneficiary,
+            chequebook_chain,
+            state_dir,
+            price_plur_per_kib,
+            min_cheque_plur,
+            settle_every_plur,
+            max_outstanding_plur,
+            credit_ratio,
+            meter_hard,
         } => {
             // Premined overlay nonce. On ephemeral-FS hosts (Render,
             // Lambda) there is no persistent `--nonce-file`, so a random
@@ -2092,6 +2437,100 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let node_identity = std::env::var("HOVERFLY_PUSHER_IDENTITY")
                 .ok()
                 .filter(|s| !s.trim().is_empty());
+            // Metered mode is all-or-nothing: every precondition is checked
+            // here and in `build_metered`, and a failure refuses to start
+            // rather than serving a half-configured meter that a paying
+            // client would discover the hard way.
+            // Env fallbacks so a deployed relay can be switched to metered
+            // without changing its start command — the same pattern
+            // HOVERFLY_PUSH_POOL and HOVERFLY_PUSHER_IDENTITY already use,
+            // and the only lever available on hosts where the command line
+            // is fixed by the platform.
+            let envs = |k: &str| std::env::var(k).ok().filter(|s| !s.trim().is_empty());
+            // Truthy parsing: `1`/`true`/`yes`/`on` enable; `0`/`false`/`no`/
+            // `off`/empty never do. The old `v != "0"` treated
+            // `HOVERFLY_METER=false` as *enabled* — a boolean footgun on a
+            // money switch.
+            let truthy = |v: &str| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            };
+            let meter = meter || envs("HOVERFLY_METER").is_some_and(|v| truthy(&v));
+            let meter_hard = meter_hard || envs("HOVERFLY_METER_HARD").is_some_and(|v| truthy(&v));
+            let split_origins = |v: String| -> Vec<String> {
+                v.split(',')
+                    .map(|s| s.trim().trim_end_matches('/').to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            };
+            let origin = if origin.is_empty() {
+                envs("HOVERFLY_METER_ORIGIN")
+                    .map(split_origins)
+                    .unwrap_or_default()
+            } else {
+                // CLI repeated `--origin a --origin b` is already split by
+                // clap; a single `--origin a,b` is one hostname that never
+                // matches — split it too so CLI and env agree.
+                origin.into_iter().flat_map(|o| split_origins(o)).collect()
+            };
+            let beneficiary = beneficiary.or_else(|| envs("HOVERFLY_METER_BENEFICIARY"));
+            let state_dir = state_dir.or_else(|| envs("HOVERFLY_METER_STATE_DIR").map(Into::into));
+            let parse_env_plur = |k: &str| -> Result<Option<u128>, String> {
+                match envs(k) {
+                    Some(v) => v.parse().map(Some).map_err(|e| format!("{k}: {e}")),
+                    None => Ok(None),
+                }
+            };
+            let price_plur_per_kib =
+                price_plur_per_kib.or(parse_env_plur("HOVERFLY_METER_PRICE_PLUR_PER_KIB")?);
+            let min_cheque_plur =
+                min_cheque_plur.or(parse_env_plur("HOVERFLY_METER_MIN_CHEQUE_PLUR")?);
+            let settle_every_plur =
+                settle_every_plur.or(parse_env_plur("HOVERFLY_METER_SETTLE_EVERY_PLUR")?);
+            let max_outstanding_plur =
+                max_outstanding_plur.or(parse_env_plur("HOVERFLY_METER_MAX_OUTSTANDING_PLUR")?);
+            let credit_ratio = credit_ratio.or(parse_env_plur("HOVERFLY_METER_CREDIT_RATIO")?);
+            let meter_opts = if meter {
+                let mut params = hoverfly::meter::Params::default();
+                if let Some(v) = price_plur_per_kib {
+                    params.price_plur_per_kib = v;
+                }
+                if let Some(v) = min_cheque_plur {
+                    params.min_cheque_plur = v;
+                }
+                if let Some(v) = settle_every_plur {
+                    params.settle_every_plur = v;
+                }
+                if let Some(v) = max_outstanding_plur {
+                    params.max_outstanding_plur = v;
+                }
+                if let Some(v) = credit_ratio {
+                    params.credit_ratio = v;
+                }
+                let beneficiary = beneficiary
+                    .as_deref()
+                    .ok_or("--meter requires --beneficiary")?;
+                let raw = hex::decode(beneficiary.trim_start_matches("0x"))
+                    .map_err(|e| format!("--beneficiary: {e}"))?;
+                if raw.len() != 20 {
+                    return Err("--beneficiary must be a 20-byte address".into());
+                }
+                let mut b = [0u8; 20];
+                b.copy_from_slice(&raw);
+                Some(hoverfly::pusher::MeterOpts {
+                    origins: origin,
+                    beneficiary: b,
+                    chain_id: chequebook_chain,
+                    params,
+                    state_dir: state_dir
+                        .ok_or("--meter requires --state-dir (durable state is mandatory)")?,
+                    hard_mode: meter_hard,
+                })
+            } else {
+                None
+            };
             hoverfly::pusher::run(hoverfly::pusher::PusherOpts {
                 listen,
                 peerlist,
@@ -2101,6 +2540,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 rpc_url,
                 node_identity,
                 transport: cfg,
+                meter: meter_opts,
             })
             .await?;
         }
@@ -2527,7 +2967,227 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
+        #[cfg(all(unix, feature = "pusher"))]
+        Commands::Cashout {
+            rpc_url,
+            key,
+            state_dir,
+            recipient,
+            min_amount,
+            chequebook,
+            dry_run,
+            chain_id,
+            timeout,
+        } => {
+            let signer = parse_signer(&key)?;
+            let beneficiary = signer.address();
+            let recipient: alloy_primitives::Address = match recipient {
+                Some(r) => r.parse().map_err(|e| format!("--recipient: {e}"))?,
+                None => beneficiary,
+            };
+            let floor = parse_bzz_amount(&min_amount)?;
+            let only: Option<alloy_primitives::Address> = match chequebook {
+                Some(c) => Some(c.parse().map_err(|e| format!("--chequebook: {e}"))?),
+                None => None,
+            };
+            let ledger_path = state_dir.join("ledger.json");
+            let ledger = hoverfly::ledger::Ledger::load_or_create(&ledger_path)
+                .map_err(|e| format!("reading {}: {e}", ledger_path.display()))?;
+            let held = ledger.held_cheques();
+            println!(
+                "beneficiary 0x{}  recipient 0x{}  ({} cheque(s) held)",
+                hex::encode(beneficiary),
+                hex::encode(recipient),
+                held.len()
+            );
+            if held.is_empty() {
+                println!("nothing to cash");
+                return Ok(());
+            }
+            let mut cashed = 0usize;
+            let mut skipped = 0usize;
+            for (account, cb, cheque) in held {
+                let cb_addr = alloy_primitives::Address::from(cb);
+                if only.is_some_and(|o| o != cb_addr) {
+                    continue;
+                }
+                let cumulative = alloy_primitives::U256::from(cheque.cumulative_plur);
+                let q = hoverfly::batch::quote_cashout(
+                    &rpc_url,
+                    cb_addr,
+                    alloy_primitives::Address::from(beneficiary),
+                    cumulative,
+                )
+                .await?;
+                println!();
+                println!(
+                    "chequebook 0x{}  (account 0x{})",
+                    hex::encode(cb),
+                    hex::encode(account)
+                );
+                println!(
+                    "  cumulative   {cheque_cumulative}",
+                    cheque_cumulative = cheque.cumulative_plur
+                );
+                println!("  unclaimed    {}", q.requested_plur);
+                println!(
+                    "  payable now  {}{}",
+                    q.payable_plur,
+                    if q.would_bounce {
+                        "   <- chequebook cannot cover the claim"
+                    } else {
+                        ""
+                    }
+                );
+                if q.already_bounced {
+                    println!("  NOTE: this chequebook has bounced before");
+                }
+                if cheque.signature == [0u8; 65] {
+                    println!("  SKIP: no stored signature (ledger predates signature persistence)");
+                    skipped += 1;
+                    continue;
+                }
+                if q.payable_plur < floor {
+                    println!(
+                        "  SKIP: below --min-amount ({min_amount} BZZ); gas would cost more than this collects"
+                    );
+                    skipped += 1;
+                    continue;
+                }
+                if dry_run {
+                    println!("  DRY RUN: would cash {}", q.payable_plur);
+                    continue;
+                }
+                let tx = hoverfly::batch::cash_cheque(
+                    &signer,
+                    &rpc_url,
+                    chain_id,
+                    cb_addr,
+                    recipient,
+                    cumulative,
+                    &cheque.signature,
+                    std::time::Duration::from_secs(timeout),
+                )
+                .await?;
+                println!("  CASHED  tx 0x{}", hex::encode(tx));
+                cashed += 1;
+            }
+            println!();
+            println!("{cashed} cashed, {skipped} skipped");
+        }
         #[cfg(unix)]
+        Commands::Chequebook { action } => match action {
+            ChequebookAction::Deploy {
+                rpc_url,
+                key,
+                chain_id,
+                timeout,
+            } => {
+                let signer = parse_signer(&key)?;
+                let issuer = signer.address();
+                let factory =
+                    hoverfly::batch::swap_factory_for_chain(chain_id).ok_or_else(|| {
+                        format!(
+                            "no vetted SimpleSwapFactory for chain {chain_id} — a factory address \
+                         must never be guessed, since a fake one can return a forged issuer()"
+                        )
+                    })?;
+                println!("deploying chequebook: issuer 0x{}", hex::encode(issuer));
+                println!("  factory  0x{}", hex::encode(factory));
+                let out = hoverfly::batch::deploy_chequebook(
+                    &signer,
+                    hoverfly::batch::DeployChequebookParams {
+                        rpc_url,
+                        chain_id,
+                        factory,
+                        issuer,
+                        receipt_timeout: std::time::Duration::from_secs(timeout),
+                    },
+                )
+                .await?;
+                if out.already_deployed {
+                    println!("  already deployed at 0x{}", hex::encode(out.address));
+                } else {
+                    println!("  tx       0x{}", hex::encode(out.tx));
+                    println!("  deployed 0x{}", hex::encode(out.address));
+                }
+                println!();
+                println!("Fund it before it can pay anything:");
+                println!(
+                    "  hoverfly chequebook fund --key <KEY> --chequebook 0x{} --amount 0.05",
+                    hex::encode(out.address)
+                );
+            }
+            ChequebookAction::Fund {
+                rpc_url,
+                key,
+                chequebook,
+                amount,
+                chain_id,
+                timeout,
+            } => {
+                let signer = parse_signer(&key)?;
+                let cb: alloy_primitives::Address = chequebook
+                    .parse()
+                    .map_err(|e| format!("--chequebook: {e}"))?;
+                let plur = parse_bzz_amount(&amount)?;
+                // Gnosis only: there is no vetted Sepolia BZZ token const,
+                // and funding via the wrong ERC-20 would transfer the wrong
+                // token (or fail confusingly). Reject non-Gnosis here rather
+                // than funding with the mainnet token address.
+                if chain_id != 100 {
+                    return Err(format!(
+                        "chequebook fund supports Gnosis (chain 100) only; got chain {chain_id}"
+                    )
+                    .into());
+                }
+                let bzz: alloy_primitives::Address = hoverfly::batch::MAINNET_BZZ_TOKEN
+                    .parse()
+                    .map_err(|e| format!("bzz token: {e}"))?;
+                println!(
+                    "funding 0x{} with {amount} BZZ ({plur} PLUR)",
+                    hex::encode(cb)
+                );
+                let tx = hoverfly::batch::fund_chequebook(
+                    &signer,
+                    &rpc_url,
+                    chain_id,
+                    bzz,
+                    cb,
+                    plur,
+                    std::time::Duration::from_secs(timeout),
+                )
+                .await?;
+                println!("  tx 0x{}", hex::encode(tx));
+            }
+            ChequebookAction::Status {
+                rpc_url,
+                chequebook,
+                beneficiary,
+            } => {
+                let cb: alloy_primitives::Address = chequebook
+                    .parse()
+                    .map_err(|e| format!("--chequebook: {e}"))?;
+                let ben: alloy_primitives::Address = match beneficiary {
+                    Some(b) => b.parse().map_err(|e| format!("--beneficiary: {e}"))?,
+                    None => alloy_primitives::Address::ZERO,
+                };
+                let st = hoverfly::batch::read_chequebook_state(&rpc_url, cb, ben).await?;
+                println!("chequebook 0x{}", hex::encode(cb));
+                println!("  issuer            0x{}", hex::encode(st.issuer));
+                println!("  liquid for 0x{}  {}", hex::encode(ben), st.liquid_for_us);
+                println!("  paid out to it    {}", st.paid_out_to_us);
+                println!(
+                    "  bounced           {}{}",
+                    st.bounced,
+                    if st.bounced {
+                        "  <- a relay will refuse this chequebook"
+                    } else {
+                        ""
+                    }
+                );
+            }
+        },
         Commands::Batch { action } => match action {
             BatchAction::Create {
                 rpc_url,
@@ -2768,4 +3428,75 @@ fn whole_to_smallest_unit(whole: f64, decimals: u8) -> Option<alloy_primitives::
         return None;
     }
     Some(alloy_primitives::U256::from(scaled as u128))
+}
+
+/// Parse a 32-byte hex private key into a signer.
+#[cfg(unix)]
+fn parse_signer(
+    key: &str,
+) -> Result<alloy_signer_local::PrivateKeySigner, Box<dyn std::error::Error>> {
+    let raw = hex::decode(key.trim_start_matches("0x"))?;
+    if raw.len() != 32 {
+        return Err(format!("key must be 32 bytes hex, got {}", raw.len()).into());
+    }
+    Ok(alloy_signer_local::PrivateKeySigner::from_slice(&raw)?)
+}
+
+/// Decimal BZZ → PLUR. BZZ has **16** decimals, not 18: getting this wrong
+/// by two orders of magnitude is the kind of mistake that silently deposits
+/// 100× too little and makes every cheque bounce.
+#[cfg(unix)]
+fn parse_bzz_amount(s: &str) -> Result<alloy_primitives::U256, Box<dyn std::error::Error>> {
+    const DECIMALS: usize = 16;
+    let s = s.trim();
+    let (whole, frac) = match s.split_once('.') {
+        Some((w, f)) => (w, f),
+        None => (s, ""),
+    };
+    if frac.len() > DECIMALS {
+        return Err(format!("BZZ has {DECIMALS} decimals; '{s}' has more").into());
+    }
+    if whole.is_empty() && frac.is_empty() {
+        return Err("empty amount".into());
+    }
+    let mut digits = String::from(whole);
+    digits.push_str(frac);
+    digits.push_str(&"0".repeat(DECIMALS - frac.len()));
+    if !digits.chars().all(|c| c.is_ascii_digit()) {
+        return Err(format!("'{s}' is not a decimal amount").into());
+    }
+    Ok(alloy_primitives::U256::from_str_radix(&digits, 10)?)
+}
+
+#[cfg(all(test, unix))]
+mod chequebook_cli_tests {
+    use super::*;
+
+    /// BZZ has 16 decimals. An 18-decimal assumption would under-fund by
+    /// 100×, and every cheque drawn on it would then fail the relay's
+    /// funding check for no visible reason.
+    #[test]
+    fn bzz_amounts_use_sixteen_decimals() {
+        let one = parse_bzz_amount("1").expect("1 BZZ");
+        assert_eq!(one.to_string(), "10000000000000000");
+        assert_eq!(
+            parse_bzz_amount("0.05").expect("0.05").to_string(),
+            "500000000000000"
+        );
+        assert_eq!(
+            parse_bzz_amount("0.0001").expect("small").to_string(),
+            "1000000000000"
+        );
+        assert_eq!(
+            parse_bzz_amount("1.5").expect("1.5").to_string(),
+            "15000000000000000"
+        );
+    }
+
+    #[test]
+    fn malformed_amounts_are_refused() {
+        for bad in ["", ".", "abc", "1.2.3", "-1", "0.00000000000000001"] {
+            assert!(parse_bzz_amount(bad).is_err(), "{bad} must be refused");
+        }
+    }
 }

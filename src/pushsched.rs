@@ -83,6 +83,10 @@ pub enum LaneHealth {
     /// 35 s to first byte on a sleeping instance), and a cold lane must not
     /// be able to swallow a full-size batch before proving it is awake.
     Warming,
+    /// Over its credit line, or the client has no way to pay it. Ineligible
+    /// but **not terminal** — unlike `Retired`, which is permanent for the
+    /// run. Cleared by [`Scheduler::fund_lane`] once a cheque is accepted.
+    Unfunded,
     /// Serving normally.
     Live,
     /// Failing; not eligible until `until_ms`.
@@ -109,6 +113,23 @@ pub struct LaneInfo {
     pub budget_remaining_gb: Option<f64>,
     /// Live warm sessions; the strongest available prior on throughput.
     pub pool_live: Option<usize>,
+    /// Price in PLUR per KiB of body, from a *verified* signed quote
+    /// (`docs/pusher-incentives.md` §7.3). `None` on an `open` lane, and
+    /// also `None` when the quote failed verification — an unverifiable
+    /// quote is treated as "not metered" rather than "free", so the lane is
+    /// simply not paid and not scheduled for payment.
+    pub price_plur_per_kib: Option<u128>,
+    /// True when the lane enforces 402 rather than metering softly.
+    ///
+    /// Deliberately *not* behind the `pusher` feature: a client that cannot
+    /// pay still has to recognise a lane that will refuse it, and the
+    /// browser build compiles without the payment stack entirely.
+    pub hard_enforcement: bool,
+    /// The whole verified quote, when this lane advertised one. Carried so
+    /// the payment loop has the beneficiary and parameters without
+    /// re-fetching and re-verifying `/v1/status`.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub quote: Option<crate::payer::PaymentQuote>,
 }
 
 /// Tunables. Defaults are the shipping configuration.
@@ -229,6 +250,8 @@ impl Lane {
         match self.health {
             LaneHealth::Live | LaneHealth::Warming => true,
             LaneHealth::Backoff { until_ms } => now_ms >= until_ms,
+            // Ineligible until paid, but recoverable within this run.
+            LaneHealth::Unfunded => false,
             LaneHealth::Retired => false,
         }
     }
@@ -307,6 +330,15 @@ pub enum BatchOutcome {
     Answered,
     /// Transport error, non-2xx, or an unparseable body.
     Failed(String),
+    /// `402 Payment Required` — the account is over its credit line on this
+    /// lane (`docs/pusher-incentives.md` §12).
+    ///
+    /// **Not a failure.** Mapping it to `Failed` would charge lane health
+    /// for a *routine settlement*: five of them retire a perfectly healthy
+    /// lane mid-upload, which is the opposite of what should happen when a
+    /// relay says "pay me". The lane is paused until a cheque clears and its
+    /// streak is left untouched.
+    PaymentRequired,
 }
 
 /// Why a run couldn't finish.
@@ -333,6 +365,7 @@ pub enum LaneHealthKind {
     Warming,
     Live,
     Backoff,
+    Unfunded,
     Retired,
 }
 
@@ -726,6 +759,61 @@ impl Scheduler {
             .retain(|&k| self.chunks[k].phase == ChunkPhase::Pending);
     }
 
+    /// Bring a lane back after a cheque has been accepted.
+    ///
+    /// The counterpart to `PaymentRequired`: because that outcome left
+    /// `fail_streak` and `backoff_exp` alone, settling restores the lane to
+    /// exactly the health it had before it ran out of credit, rather than
+    /// making it re-warm.
+    pub fn fund_lane(&mut self, lane: usize) {
+        if let Some(l) = self.lanes.get_mut(lane)
+            && l.health == LaneHealth::Unfunded
+        {
+            l.health = if l.bytes_total > 0 {
+                LaneHealth::Live
+            } else {
+                LaneHealth::Warming
+            };
+        }
+    }
+
+    /// Take a lane out of rotation permanently.
+    ///
+    /// For lanes that are unusable by configuration rather than by
+    /// behaviour — a lane enforcing payment this client cannot make — where
+    /// there is nothing to discover by trying and every attempt costs the
+    /// chunks one of their retries.
+    pub fn retire_lane(&mut self, lane: usize) {
+        if let Some(l) = self.lanes.get_mut(lane) {
+            l.health = LaneHealth::Retired;
+        }
+    }
+
+    /// Re-clamp a lane's frames-per-POST between dispatches.
+    ///
+    /// A metered lane's affordable body shrinks as debt and in-flight bytes
+    /// accumulate and grows back as cheques clear, so the ceiling set at
+    /// startup goes stale immediately. Sizing the assignment here is what
+    /// keeps the client from building a body the relay will refuse — §7.2
+    /// wants the POST sized to fit rather than the ceiling discovered as a
+    /// 402.
+    pub fn set_lane_batch_max(&mut self, lane: usize, max: usize) {
+        if let Some(l) = self.lanes.get_mut(lane) {
+            l.info.batch_max = Some(max.max(1));
+        }
+    }
+
+    /// Lanes currently paused for payment, so the driver knows which ones a
+    /// cheque would unblock.
+    pub fn unfunded_lanes(&self) -> Vec<usize> {
+        self.lanes
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.health == LaneHealth::Unfunded)
+            .map(|(i, _)| i)
+            .collect()
+    }
+
     /// Record the HTTP-level result of a dispatch. Must be called exactly
     /// once per [`Assignment`], after all of that batch's acks.
     pub fn on_batch_result(&mut self, batch: u64, outcome: BatchOutcome, now_ms: u64) {
@@ -745,6 +833,23 @@ impl Scheduler {
                 l.fail_streak = 0;
                 l.backoff_exp = 0;
                 l.health = LaneHealth::Live;
+            }
+            // A 402 says the relay is willing and the client is behind on
+            // payment. Pause the lane without touching `fail_streak` or
+            // `backoff_exp`, so settling restores it instantly and a long
+            // upload is not punished for crossing a settlement window.
+            // It also must not consume a retry attempt: a routine
+            // settlement every ~32 MiB would otherwise fail a large upload
+            // after a handful of windows. Undo the dispatch increment.
+            BatchOutcome::PaymentRequired => {
+                self.lanes[lane].health = LaneHealth::Unfunded;
+                for &ci in &chunks {
+                    let c = &mut self.chunks[ci];
+                    if matches!(c.phase, ChunkPhase::Done | ChunkPhase::Skipped) {
+                        continue;
+                    }
+                    c.attempts = c.attempts.saturating_sub(1);
+                }
             }
             _ => {
                 let l = &mut self.lanes[lane];
@@ -914,12 +1019,25 @@ impl Scheduler {
         let any_eligible = self.lanes.iter().any(|l| l.eligible(now_ms));
         if !any_eligible {
             // Backed-off lanes will come back; only a fully retired set is
-            // terminal.
+            // terminal. An all-`Unfunded` set with nothing in flight is the
+            // same kind of terminal for a driver that cannot mint a cheque
+            // (dust residual below the floor): report it rather than
+            // waiting on a channel that never fires.
             let all_retired = self
                 .lanes
                 .iter()
                 .all(|l| matches!(l.health, LaneHealth::Retired));
-            return all_retired.then_some(StallReason::AllLanesDown);
+            if all_retired {
+                return Some(StallReason::AllLanesDown);
+            }
+            let all_unfunded_or_retired = self
+                .lanes
+                .iter()
+                .all(|l| matches!(l.health, LaneHealth::Retired | LaneHealth::Unfunded));
+            if all_unfunded_or_retired {
+                return Some(StallReason::AllLanesDown);
+            }
+            return None;
         }
         if self.pending.is_empty() {
             return Some(StallReason::ChunksExhausted);
@@ -962,6 +1080,7 @@ impl Scheduler {
                     LaneHealth::Warming => LaneHealthKind::Warming,
                     LaneHealth::Live => LaneHealthKind::Live,
                     LaneHealth::Backoff { .. } => LaneHealthKind::Backoff,
+                    LaneHealth::Unfunded => LaneHealthKind::Unfunded,
                     LaneHealth::Retired => LaneHealthKind::Retired,
                 }),
             })

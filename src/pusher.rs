@@ -92,6 +92,34 @@ const PUSH_POOL_TARGET_DEFAULT: usize = 128;
 const PUSH_POOL_TARGET_MAX: usize = 512;
 /// Per-chunk retry budget on the push path.
 const PUSH_MAX_RETRIES: usize = 20;
+/// Default cap on concurrent inbound connections
+/// (`HOVERFLY_PUSH_MAX_CONNS`). A `/v1/push` in flight holds its collected
+/// body plus decoded frames — a couple of MiB at `PUSH_BATCH_MAX` — so an
+/// uncapped accept loop is an uncapped memory commitment.
+const PUSH_MAX_CONNS_DEFAULT: usize = 256;
+/// Ceiling on the accept-loop retry backoff.
+const ACCEPT_BACKOFF_MAX_MS: u64 = 1000;
+/// How long a connection may take to send its request headers. Only the
+/// header read — response streaming is unbounded by design.
+const HEADER_READ_TIMEOUT_SECS: u64 = 30;
+/// How long `/v1/push` may take to receive its (already size-capped) body.
+/// Generous for ~2 MiB on a slow mobile link, but finite: the read happens
+/// before any work is spawned, so an unbounded one is free to hold.
+const PUSH_BODY_READ_TIMEOUT_SECS: u64 = 120;
+/// Bound on the `batch_id → owner` cache. Batch ids are enumerable
+/// on-chain (`BatchCreated`), so an unbounded map is a remote memory sink.
+const OWNER_CACHE_CAP: usize = 4096;
+/// How long a successful batch resolution stays cached. Bounded so a batch
+/// that expires while cached stops being served indefinitely.
+const OWNER_OK_TTL_SECS: u64 = 1800;
+/// How long a *definitive* rejection (absent on-chain, or expired) stays
+/// cached. This is what stops a flood of bogus batch ids from turning one
+/// unauthenticated POST into one RPC round trip per frame.
+const OWNER_BAD_TTL_SECS: u64 = 300;
+/// Distinct batch resolutions that may reach the chain in a single POST.
+/// Honest clients push one or a few batches per request; this bounds the
+/// RPC amplification of a request that names 512 different ones.
+const PUSH_MAX_BATCH_LOOKUPS: usize = 8;
 /// Recently-acked address cache: enough to cover several in-flight
 /// batches across every lane a client might hedge between.
 const RECENT_ACK_CAP: usize = 8192;
@@ -125,6 +153,30 @@ pub struct PusherOpts {
     /// HOVERFLY_PUSHER_IDENTITY. `None` = reuse the stamp key.
     pub node_identity: Option<String>,
     pub transport: TransportConfig,
+    /// Metered mode (`docs/pusher-incentives.md` Stage 1). `None` = `open`,
+    /// today's unmetered behaviour, which the production lanes keep running.
+    pub meter: Option<MeterOpts>,
+}
+
+/// Everything `--meter` needs. Validated at startup: a relay that cannot
+/// state its own origin, or whose parameters violate §10.1's invariant,
+/// refuses to boot rather than serving a broken meter.
+#[derive(Debug, Clone)]
+pub struct MeterOpts {
+    /// `--origin`, one or more. **Required**, and never derived from a
+    /// request header (§11.1).
+    pub origins: Vec<String>,
+    /// EOA that must appear as `Cheque.beneficiary`. The relay holds the
+    /// address only — never the key (§6).
+    pub beneficiary: [u8; 20],
+    /// Settlement chain. Pins the EIP-712 domain and the factory.
+    pub chain_id: u64,
+    pub params: crate::meter::Params,
+    /// Where the ledger and relay secret live. Required: metered mode
+    /// without durable state is an unbounded free-service loop (§11.4).
+    pub state_dir: PathBuf,
+    /// Stage 2. False = soft mode: meter and report, never refuse.
+    pub hard_mode: bool,
 }
 
 struct State {
@@ -143,9 +195,82 @@ struct State {
     /// /v1/push requests (filled lazily on first push). `None` transport
     /// means the node key was unresolvable; /v1/push then 503s.
     push: Option<PushState>,
-    /// `batch_id(hex) → on-chain owner`, so repeated pushes for one batch
-    /// cost a single RPC.
-    owner_cache: std::sync::Mutex<HashMap<String, [u8; 20]>>,
+    /// `batch_id(hex) → resolution`, so repeated pushes for one batch cost a
+    /// single RPC. Caches rejections too — see [`OwnerCache`].
+    owner_cache: std::sync::Mutex<OwnerCache>,
+    /// Stage 0 shadow metering (`src/meter.rs`, incentives §14): counts what
+    /// a metered relay *would* have billed, bills nothing, and changes
+    /// nothing on the wire. Merged once per request, never per frame.
+    meter: std::sync::Mutex<crate::meter::Meter>,
+    /// Stage 1 metered mode. `None` in `open` mode, which is every
+    /// production lane today.
+    metered: Option<crate::metered::Metered>,
+}
+
+/// Outcome of resolving a batch id on-chain.
+#[derive(Clone)]
+enum OwnerLookup {
+    /// Batch exists, is funded, and is owned by this address. Carries the
+    /// batch's total remaining value in PLUR (`remainingBalance × 2^depth`),
+    /// which costs nothing extra — `resolve_owner` already reads both halves
+    /// to check for expiry — and is what Stage 0 shadow metering prices a
+    /// credit line from (`src/meter.rs`, incentives §10.3).
+    Owner([u8; 20], u128),
+    /// Batch is *definitively* unusable: absent on-chain, or out of
+    /// balance. Carries the reason so the ack is unchanged.
+    Rejected(String),
+}
+
+/// Bounded, TTL'd `batch_id → outcome` cache.
+///
+/// Caching only *successes* was a live amplification bug. `stamp::validate`
+/// checks that a signature recovers to a non-zero address and nothing else,
+/// so any random key over any attacker-chosen batch id reaches the chain
+/// read. With no negative entry, every frame naming a bogus batch re-issued
+/// the RPC, so one unauthenticated POST of `PUSH_BATCH_MAX` frames became
+/// that many serial `eth_call`s. Rejections are cached for a shorter TTL
+/// than successes, so a batch that is topped up recovers quickly.
+///
+/// Only definitive on-chain answers are cached. A transport error is *not*
+/// cached — an RPC blip must not blacklist a live batch.
+struct OwnerCache {
+    map: HashMap<String, (OwnerLookup, Instant)>,
+    order: std::collections::VecDeque<String>,
+    cap: usize,
+}
+
+impl OwnerCache {
+    fn new(cap: usize) -> Self {
+        Self {
+            map: HashMap::new(),
+            order: std::collections::VecDeque::new(),
+            cap,
+        }
+    }
+
+    fn get(&self, batch_id_hex: &str) -> Option<OwnerLookup> {
+        let (entry, when) = self.map.get(batch_id_hex)?;
+        let ttl = match entry {
+            OwnerLookup::Owner(..) => OWNER_OK_TTL_SECS,
+            OwnerLookup::Rejected(_) => OWNER_BAD_TTL_SECS,
+        };
+        (when.elapsed() < std::time::Duration::from_secs(ttl)).then(|| entry.clone())
+    }
+
+    fn insert(&mut self, batch_id_hex: &str, entry: OwnerLookup) {
+        if self
+            .map
+            .insert(batch_id_hex.to_string(), (entry, Instant::now()))
+            .is_none()
+        {
+            self.order.push_back(batch_id_hex.to_string());
+        }
+        while self.order.len() > self.cap {
+            if let Some(old) = self.order.pop_front() {
+                self.map.remove(&old);
+            }
+        }
+    }
 }
 
 struct PushState {
@@ -160,6 +285,10 @@ struct PushState {
     /// maintenance loop so the (sync) status handler never has to touch
     /// the async pool mutex.
     pool_live: AtomicUsize,
+    /// The node-identity key. Kept alongside the transport (which owns its
+    /// own clone) so the metered quote can be signed without rebuilding it
+    /// — it signs prices, never payments, and is not spendable (§6).
+    signer: crate::signer::SwarmSigner,
     /// This node's Kademlia overlay (node eth address + nonce). Published
     /// in `/v1/status` so a multi-lane client can route each chunk to the
     /// relay whose overlay is nearest the chunk's destination neighborhood
@@ -171,21 +300,31 @@ struct PushState {
     /// The client turns `budget_remaining_gb` into a scheduling weight.
     budget_gb: Option<f64>,
     bytes_pushed: AtomicU64,
-    /// Addresses acked recently, so a duplicate frame (client hedging a
-    /// straggler across two lanes) is answered from cache instead of
-    /// paying a second real push. docs/pusher-design.md §7 "ChunkCache".
+    /// (Address, batch) pairs acked recently, so a duplicate frame (client
+    /// hedging a straggler across two lanes) is answered from cache
+    /// instead of paying a second real push. Keyed by batch so a dedup
+    /// hit can't substitute another uploader's stamp.
+    /// docs/pusher-design.md §7 "ChunkCache".
     recent: std::sync::Mutex<RecentAcks>,
 }
 
-/// Bounded, TTL'd set of recently-acked chunk addresses.
+/// Bounded, TTL'd set of recently-acked (chunk address, batch).
+///
+/// Keyed on the batch too: a chunk address is content-derived, so it is
+/// not unique across batch owners. Under a bare-address key a dedup hit
+/// acks a frame `ok` while silently discarding the submitted stamp — one
+/// uploader's dust batch could shadow another uploader's long-lived
+/// batch for the TTL, and the victim's chunk is then garbage-collected
+/// when the shadowing batch expires (docs/pusher-incentives.md §15). It
+/// also fires spuriously between honest users uploading identical bytes.
 ///
 /// Insert order doubles as eviction order (a chunk's ack time only moves
-/// forward), so a `VecDeque` of `(addr, when)` plus a `HashMap` index is
-/// enough — no LRU bookkeeping, since re-acking an address doesn't need
-/// to extend its life.
+/// forward), so a `VecDeque` of `((addr, batch), when)` plus a `HashMap`
+/// index is enough — no LRU bookkeeping, since re-acking an entry
+/// doesn't need to extend its life.
 struct RecentAcks {
-    seen: HashMap<[u8; 32], Instant>,
-    order: std::collections::VecDeque<[u8; 32]>,
+    seen: HashMap<([u8; 32], [u8; 32]), Instant>,
+    order: std::collections::VecDeque<([u8; 32], [u8; 32])>,
     cap: usize,
     ttl: std::time::Duration,
 }
@@ -200,13 +339,16 @@ impl RecentAcks {
         }
     }
 
-    fn contains(&self, addr: &[u8; 32]) -> bool {
-        self.seen.get(addr).is_some_and(|t| t.elapsed() < self.ttl)
+    fn contains(&self, addr: &[u8; 32], batch_id: [u8; 32]) -> bool {
+        self.seen
+            .get(&(*addr, batch_id))
+            .is_some_and(|t| t.elapsed() < self.ttl)
     }
 
-    fn insert(&mut self, addr: [u8; 32]) {
-        if self.seen.insert(addr, Instant::now()).is_none() {
-            self.order.push_back(addr);
+    fn insert(&mut self, addr: [u8; 32], batch_id: [u8; 32]) {
+        let key = (addr, batch_id);
+        if self.seen.insert(key, Instant::now()).is_none() {
+            self.order.push_back(key);
         }
         while self.order.len() > self.cap {
             if let Some(old) = self.order.pop_front() {
@@ -238,12 +380,23 @@ pub async fn run(opts: PusherOpts) -> Result<(), Box<dyn std::error::Error>> {
         warn!("push node identity unresolvable; /v1/push will 503 (probe/status still work)");
     }
 
+    // Metered mode is validated *before* the listener binds. Every failure
+    // here is one that would otherwise be discovered by a paying client:
+    // a parameter set that bricks accounts (§10.1), an origin the relay
+    // cannot state (§11.1), a chain with no vetted factory (§6), or state
+    // it cannot persist (§11.4). Refuse to boot instead.
+    let metered = match build_metered(&opts) {
+        Ok(m) => m,
+        Err(e) => return Err(format!("--meter: {e}").into()),
+    };
+
     let listener = tokio::net::TcpListener::bind(opts.listen).await?;
     info!(
-        "pusher listening on http://{} (probe {}; push {}; {} known peers from {})",
+        "pusher listening on http://{} (probe {}; push {}; mode {}; {} known peers from {})",
         opts.listen,
         if opts.probe_enabled { "ON" } else { "off" },
         if push.is_some() { "ON" } else { "off" },
+        if metered.is_some() { "metered" } else { "open" },
         peers_known,
         opts.peerlist.display(),
     );
@@ -255,7 +408,9 @@ pub async fn run(opts: PusherOpts) -> Result<(), Box<dyn std::error::Error>> {
         peers_known: AtomicUsize::new(peers_known),
         batch_cache: std::sync::Mutex::new(HashMap::new()),
         push,
-        owner_cache: std::sync::Mutex::new(HashMap::new()),
+        owner_cache: std::sync::Mutex::new(OwnerCache::new(OWNER_CACHE_CAP)),
+        meter: std::sync::Mutex::new(crate::meter::Meter::default()),
+        metered,
     });
 
     // Background warm-pool maintenance: fill on startup and keep the pool
@@ -266,26 +421,76 @@ pub async fn run(opts: PusherOpts) -> Result<(), Box<dyn std::error::Error>> {
         tokio::spawn(async move { push_maintenance(s).await });
     }
 
+    // Bound concurrent connections. The permit is held for the connection's
+    // lifetime, so once `max_conns` are in flight the loop stops accepting and
+    // the OS backlog supplies the backpressure. Without this the accept loop
+    // spawned per connection with no cap at all, and (see the timer below)
+    // held those connections open forever.
+    let max_conns = std::env::var("HOVERFLY_PUSH_MAX_CONNS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .map(|n| n.clamp(8, 4096))
+        .unwrap_or(PUSH_MAX_CONNS_DEFAULT);
+    info!("pusher connection cap = {max_conns} (HOVERFLY_PUSH_MAX_CONNS to override)");
+    let conns = Arc::new(tokio::sync::Semaphore::new(max_conns));
+    let mut accept_backoff_ms = 0u64;
+
     loop {
-        let (stream, _remote) = listener.accept().await?;
+        let Ok(permit) = conns.clone().acquire_owned().await else {
+            break Ok(()); // semaphore closed — shutting down
+        };
+        let (stream, remote) = match listener.accept().await {
+            Ok(v) => {
+                accept_backoff_ms = 0;
+                v
+            }
+            Err(e) => {
+                // Per-connection accept errors (EMFILE, ENFILE, ECONNABORTED)
+                // are exactly what a connection burst produces against a
+                // process that also holds a warm libp2p pool. Propagating
+                // them with `?` killed the whole relay; back off instead.
+                let wait = accept_backoff_ms.max(10);
+                warn!("accept error: {e} — retrying in {wait}ms");
+                tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
+                accept_backoff_ms = (wait * 2).min(ACCEPT_BACKOFF_MAX_MS);
+                continue;
+            }
+        };
         let io = hyper_util::rt::TokioIo::new(stream);
         let state = state.clone();
+        // The peer address from the accept loop, never a client-supplied
+        // header: `/v1/challenge` rate-limits per IP, and a limiter keyed on
+        // anything the caller controls limits nothing.
+        let peer_ip = remote.ip().to_string();
         tokio::spawn(async move {
+            // Held until the connection finishes, so the cap above is real.
+            let _permit = permit;
             let svc = service_fn(move |req| {
                 let state = state.clone();
-                async move { Ok::<_, Infallible>(handle(state, req).await) }
+                let peer_ip = peer_ip.clone();
+                async move { Ok::<_, Infallible>(handle(state, req, &peer_ip).await) }
             });
-            // Streamed probe responses outlive any sane header timeout;
-            // hyper's defaults are fine, errors here are just client
-            // disconnects.
+            // A timer MUST be installed or hyper's `header_read_timeout`
+            // default is silently inert: with `Time::Empty` the check logs
+            // "timeout has default, but no timer set" and returns `None`, so
+            // the previous builder had no header timeout whatsoever and a
+            // client could hold a connection open indefinitely by dribbling
+            // request headers. This bounds only the *request header* read —
+            // streamed probe and push responses are unaffected.
             let _ = hyper::server::conn::http1::Builder::new()
+                .timer(hyper_util::rt::TokioTimer::new())
+                .header_read_timeout(std::time::Duration::from_secs(HEADER_READ_TIMEOUT_SECS))
                 .serve_connection(io, svc)
                 .await;
         });
     }
 }
 
-async fn handle(state: Arc<State>, req: Request<hyper::body::Incoming>) -> Response<RespBody> {
+async fn handle(
+    state: Arc<State>,
+    req: Request<hyper::body::Incoming>,
+    peer: &str,
+) -> Response<RespBody> {
     // Browsers push cross-origin (a dApp on some origin → this relay), with a
     // custom content-type that triggers a CORS preflight. Answer OPTIONS and
     // tag every response with permissive CORS headers — the relay serves no
@@ -296,16 +501,676 @@ async fn handle(state: Arc<State>, req: Request<hyper::body::Incoming>) -> Respo
     }
     let mut resp = match (req.method(), req.uri().path()) {
         (&Method::GET, "/v1/status") => status_response(&state),
+        (&Method::GET, "/v1/meter") => meter_response(&state, req.headers()),
+        (&Method::GET, "/v1/account") => account_response(&state, req.headers()),
+        (&Method::GET, "/v1/challenge") => {
+            // Per-IP, because no account exists yet. `peer` comes from the
+            // accept loop, never from a client-supplied header.
+            challenge_response(state, req.uri().query(), peer).await
+        }
+        (&Method::POST, "/v1/pay") => pay_response(state, req).await,
         (&Method::POST, "/v1/probe") => probe_response(state, req.uri().query()),
         (&Method::POST, "/v1/tcpcheck") => tcpcheck_response(state, req.uri().query()),
         (&Method::POST, "/v1/push") => push_response(state, req).await,
-        (_, "/v1/probe") | (_, "/v1/status") | (_, "/v1/tcpcheck") | (_, "/v1/push") => {
+        (_, "/v1/probe")
+        | (_, "/v1/status")
+        | (_, "/v1/tcpcheck")
+        | (_, "/v1/push")
+        | (_, "/v1/meter")
+        | (_, "/v1/challenge")
+        | (_, "/v1/pay")
+        | (_, "/v1/account") => {
             json_line_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed")
         }
         _ => json_line_response(StatusCode::NOT_FOUND, "not found"),
     };
     add_cors(resp.headers_mut());
     resp
+}
+
+/// What admission decided, carried into the push task so completion can
+/// convert the reservation into debt. `None` in open mode.
+///
+/// **This is an RAII guard, and it has to be.** A reservation is placed
+/// before the body is read, but half a dozen things between there and the
+/// push can fail — an oversize body, a read timeout, a frame-decode error,
+/// an empty batch. Every one of those returns without ever reaching
+/// `run_push`, which is the only place `commit` runs, and `commit` is the
+/// only thing besides `release` that lowers `reserved_plur`. Paying a
+/// cheque does not help: `Ledger::credit` reduces `owed`, never `reserved`.
+///
+/// So a leaked reservation is permanent until restart, and it ratchets:
+/// under hard mode the account eventually sits above its cap with **no
+/// cheque able to clear it** — precisely the no-exit failure §10.1's
+/// invariant exists to prevent — and under soft mode the leaks accumulate
+/// against `MAX_LIVE_RESERVATIONS` until the relay sheds real clients.
+///
+/// Releasing on drop makes every exit path correct by construction,
+/// including ones added later, which is the whole reason it is a guard
+/// rather than four hand-written `release` calls.
+pub struct Admitted {
+    state: Arc<State>,
+    account: [u8; 20],
+    batch: [u8; 32],
+    reserved_plur: u128,
+    settled: bool,
+}
+
+impl Admitted {
+    /// Convert the reservation into debt for the bytes actually admitted,
+    /// releasing the remainder. Consumes the guard, so the `Drop` path
+    /// cannot double-release.
+    fn commit(mut self, billable_bytes: u64) {
+        let Some(m) = self.state.metered.as_ref() else {
+            return;
+        };
+        let billed = m.cfg.params.price_bytes(billable_bytes);
+        let mut l = m.ledger.lock().expect("ledger poisoned");
+        l.commit(self.account, self.reserved_plur, billed);
+        if let Err(e) = l.persist() {
+            // `owed` is written at batch completion, so a failed persist
+            // forfeits at most this batch — the safe direction (§10.2).
+            tracing::error!("ledger persist after commit failed: {e}");
+        }
+        self.settled = true;
+    }
+}
+
+impl Drop for Admitted {
+    fn drop(&mut self) {
+        if self.settled {
+            return;
+        }
+        if let Some(m) = self.state.metered.as_ref() {
+            m.ledger
+                .lock()
+                .expect("ledger poisoned")
+                .release(self.account, self.reserved_plur);
+        }
+    }
+}
+
+/// Metered admission for `/v1/push` (§7.2).
+///
+/// Runs before the body is read, and reads **no chain state** — the
+/// challenge already carries the credit line, resolved once when it was
+/// issued. That is what keeps up to 512 ecrecovers and an RPC round trip
+/// off the front of every request.
+fn admit_metered(
+    state: &Arc<State>,
+    req: &Request<hyper::body::Incoming>,
+) -> Result<Option<Admitted>, Box<Response<RespBody>>> {
+    let Some(m) = state.metered.as_ref() else {
+        return Ok(None);
+    };
+    let raw = req
+        .headers()
+        .get(crate::challenge::CHALLENGE_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    // **Soft mode never refuses** (§7.1). A request with no challenge is an
+    // unmetered request, served exactly as `open` mode serves it, with
+    // Stage 0 still shadow-counting it. That is the whole point of shipping
+    // soft first: a relay can be flipped to `--meter` while the existing
+    // fleet keeps working, because clients that predate the protocol simply
+    // do not send the header.
+    //
+    // Requiring it unconditionally would 401 every current client on the
+    // lane the moment metering was enabled — the opposite of a staged
+    // rollout. Hard mode does require it, because by then there is a 402 to
+    // enforce and a client that cannot present a capability cannot be
+    // billed.
+    //
+    // A header that is *present but invalid* is refused in both modes:
+    // claiming a capability you do not hold is not the same as not claiming
+    // one, and letting it through would make the check bypassable by
+    // corrupting a byte.
+    if raw.is_empty() {
+        if m.cfg.hard_mode {
+            return Err(Box::new(json_line_response(
+                StatusCode::UNAUTHORIZED,
+                "metered relay: a challenge is required (GET /v1/challenge)",
+            )));
+        }
+        return Ok(None);
+    }
+    let verified = m
+        .verify_header(raw, crate::challenge::now_unix())
+        .map_err(|e| Box::new(json_line_response(StatusCode::UNAUTHORIZED, &e)))?;
+    if !m.allow_account(&verified.account) {
+        return Err(Box::new(json_line_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            "slow down",
+        )));
+    }
+    // The reservation ledger is attacker-influenced (one entry per batch in
+    // standing), so shed rather than grow without bound (§7.2).
+    if m.shed_reservations() {
+        return Err(Box::new(json_line_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "too many accounts with live reservations",
+        )));
+    }
+    // Bound the reservation by the *declared* body. Same quantity, same
+    // arithmetic as the eventual bill (§8), so there is no estimate to be
+    // wrong about — and a one-frame POST reserves one frame's worth rather
+    // than a flat PUSH_BATCH_MAX, which is what keeps small batches usable.
+    let declared = req
+        .headers()
+        .get(hyper::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+    let Some(declared) = declared else {
+        return Err(Box::new(json_line_response(
+            StatusCode::LENGTH_REQUIRED,
+            "metered mode requires Content-Length so the reservation can be bounded",
+        )));
+    };
+    if declared > PUSH_MAX_BODY as u64 {
+        return Err(Box::new(json_line_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "body exceeds limit",
+        )));
+    }
+    let adm = m.reserve_for_body(verified.account, declared, verified.cap_plur);
+    if adm.over_cap {
+        if m.cfg.hard_mode {
+            // Hard mode: give the reservation back, then refuse. Keeping it
+            // would leak credit on every refusal.
+            m.ledger
+                .lock()
+                .expect("ledger poisoned")
+                .release(verified.account, adm.reserved_plur);
+            return Err(Box::new(json_response(
+                StatusCode::PAYMENT_REQUIRED,
+                &serde_json::json!({
+                    "error": "payment required",
+                    "outstanding_plur": adm.outstanding_plur.to_string(),
+                    "max_outstanding_plur": adm.cap_plur.to_string(),
+                    "settle_every_plur": m.cfg.params.settle_every_plur.to_string(),
+                }),
+            )));
+        }
+        // Soft mode: record and serve anyway. This is the instrument Stage 0
+        // could not provide — how often a real client *would* have been
+        // 402'd, measured against live traffic before anyone is refused.
+        tracing::info!(
+            account = %hex::encode(verified.account),
+            outstanding_plur = %adm.outstanding_plur,
+            cap_plur = %adm.cap_plur,
+            "soft-mode overshoot: this request would 402 under hard mode"
+        );
+    }
+    Ok(Some(Admitted {
+        state: state.clone(),
+        account: verified.account,
+        batch: verified.batch,
+        reserved_plur: adm.reserved_plur,
+        settled: false,
+    }))
+}
+
+/// Validate `--meter` and build the metered state, or `None` for `open`.
+///
+/// Every check here is one a paying client would otherwise discover the
+/// hard way, so all of them are fatal rather than warnings.
+fn build_metered(opts: &PusherOpts) -> Result<Option<crate::metered::Metered>, String> {
+    let Some(m) = &opts.meter else {
+        return Ok(None);
+    };
+    m.params.validate()?;
+    if m.origins.is_empty() || m.origins.iter().any(|o| o.trim().is_empty()) {
+        return Err(
+            "--origin is required and must be non-empty: the relay compares a challenge's \
+             origin against configuration, never against the Host header, and a relay that \
+             cannot state its own hostname cannot close the cross-relay replay (§11.1)"
+                .into(),
+        );
+    }
+    let factory = crate::batch::swap_factory_for_chain(m.chain_id).ok_or_else(|| {
+        format!(
+            "no vetted SimpleSwapFactory for chain {}: a factory address must never come \
+             from the wire, so metered mode cannot run here (§6)",
+            m.chain_id
+        )
+    })?;
+    if m.beneficiary == [0u8; 20] {
+        return Err("--beneficiary must be set: it is the EOA cheques are made out to".into());
+    }
+    std::fs::create_dir_all(&m.state_dir)
+        .map_err(|e| format!("--state-dir {}: {e}", m.state_dir.display()))?;
+    let ledger =
+        crate::ledger::Ledger::load_or_create(m.state_dir.join("ledger.json")).map_err(|e| {
+            format!(
+                "ledger at {}: {e} — metered mode requires durable state, because losing \
+                 last_cumulative turns one signature into unlimited free service (§11.4)",
+                m.state_dir.display()
+            )
+        })?;
+    info!(
+        "metered mode: origin(s) {} beneficiary 0x{} chain {} price {} PLUR/KiB ({} mode)",
+        m.origins.join(","),
+        hex::encode(m.beneficiary),
+        m.chain_id,
+        m.params.price_plur_per_kib,
+        if m.hard_mode { "hard" } else { "soft" },
+    );
+    Ok(Some(crate::metered::Metered::new(
+        crate::metered::MeterConfig {
+            origins: m.origins.clone(),
+            beneficiary: m.beneficiary,
+            chain_id: m.chain_id,
+            factory,
+            params: m.params,
+            hard_mode: m.hard_mode,
+        },
+        ledger,
+    )))
+}
+
+/// `GET /v1/challenge?account=&batch=` — issue a capability (§7.2).
+///
+/// This is where the chain reads happen: standing is resolved once, priced
+/// into a credit line, and baked into the nonce, so `/v1/push` admission
+/// touches no chain state at all. Amplification is bounded by *distinct
+/// batch ids* rather than request count, because the owner cache answers
+/// repeats — plus a per-IP limit on top.
+async fn challenge_response(
+    state: Arc<State>,
+    query: Option<&str>,
+    peer_ip: &str,
+) -> Response<RespBody> {
+    let Some(m) = state.metered.as_ref() else {
+        return json_line_response(StatusCode::NOT_FOUND, "relay is not metered");
+    };
+    if !m.allow_challenge(peer_ip) {
+        return json_line_response(StatusCode::TOO_MANY_REQUESTS, "slow down");
+    }
+    let q = parse_query(query);
+    let (Some(account_hex), Some(batch_hex)) = (q.get("account"), q.get("batch")) else {
+        return json_line_response(StatusCode::BAD_REQUEST, "need account= and batch=");
+    };
+    let account = match parse_hex_array::<20>(account_hex) {
+        Ok(a) => a,
+        Err(e) => return json_line_response(StatusCode::BAD_REQUEST, &format!("account: {e}")),
+    };
+    let batch = match parse_hex_array::<32>(batch_hex) {
+        Ok(b) => b,
+        Err(e) => return json_line_response(StatusCode::BAD_REQUEST, &format!("batch: {e}")),
+    };
+    let batch_id_hex = hex::encode(batch);
+    let mut budget = 1usize;
+    let (owner, remaining_value) = match resolve_owner(&state, &batch_id_hex, &mut budget).await {
+        Ok(v) => v,
+        Err(e) => return json_line_response(StatusCode::BAD_REQUEST, &e),
+    };
+    // No nonce for a batch this account does not own. Without this,
+    // admission would grant a reservation to any EOA that can sign, and
+    // free identities could occupy ledger entries without owning anything.
+    if owner != account {
+        return json_line_response(
+            StatusCode::FORBIDDEN,
+            "account is not the on-chain owner of that batch",
+        );
+    }
+    let origin = m.cfg.origins.first().cloned().unwrap_or_default();
+    match m.issue(
+        account,
+        batch,
+        remaining_value,
+        &origin,
+        crate::challenge::now_unix(),
+    ) {
+        Ok(issued) => json_response(StatusCode::OK, &issued.to_json()),
+        Err(e) => json_line_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+/// `POST /v1/pay` — accept a cheque (§11.6).
+///
+/// Ordered cheapest-first, but the *bound* comes from the two free refusals
+/// at the top: a challenge is required, and an account with no debt cannot
+/// spend a single `eth_call`. Without those, every "free" check passes for
+/// a cheque an attacker synthesizes at zero cost and each garbage POST buys
+/// one `deployedContracts` call.
+async fn pay_response(
+    state: Arc<State>,
+    req: Request<hyper::body::Incoming>,
+) -> Response<RespBody> {
+    let Some(m) = state.metered.as_ref() else {
+        return json_line_response(StatusCode::NOT_FOUND, "relay is not metered");
+    };
+    let header = req
+        .headers()
+        .get(crate::challenge::CHALLENGE_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let verified = match m.verify_header(&header, crate::challenge::now_unix()) {
+        Ok(v) => v,
+        Err(e) => return json_line_response(StatusCode::UNAUTHORIZED, &e),
+    };
+    if !m.allow_account(&verified.account) {
+        return json_line_response(StatusCode::TOO_MANY_REQUESTS, "slow down");
+    }
+    // No debt, no cheque — before parsing anything. Postpaid means an honest
+    // client always has debt by the time it settles, so this costs nothing
+    // legitimate and makes the endpoint useless to anyone who has not first
+    // done billable work.
+    let owed = m
+        .ledger
+        .lock()
+        .expect("ledger poisoned")
+        .owed(&verified.account);
+    if owed == 0 {
+        return json_line_response(StatusCode::BAD_REQUEST, "nothing owed on this account");
+    }
+
+    let body = match read_body_limited(req, crate::protocols::swap::MAX_CHEQUE_JSON).await {
+        Ok(b) => b,
+        Err(resp) => return resp,
+    };
+    let cheque = match crate::protocols::swap::decode_signed_cheque_json(&body) {
+        Ok(c) => c,
+        Err(e) => return json_line_response(StatusCode::BAD_REQUEST, &e.to_string()),
+    };
+    if cheque.beneficiary != m.cfg.beneficiary {
+        return json_line_response(StatusCode::BAD_REQUEST, "cheque is not made out to us");
+    }
+    let cumulative: u128 = match u128::try_from(cheque.cumulative_payout) {
+        Ok(v) if v <= crate::ledger::MAX_CUMULATIVE_PLUR => v,
+        _ => {
+            return json_line_response(StatusCode::BAD_REQUEST, "cumulative payout is implausible");
+        }
+    };
+    let have = m
+        .ledger
+        .lock()
+        .expect("ledger poisoned")
+        .last_cumulative(&verified.account, &cheque.chequebook);
+    if cumulative <= have {
+        return json_line_response(
+            StatusCode::BAD_REQUEST,
+            &format!("cheque cumulative {cumulative} does not exceed the {have} already accepted"),
+        );
+    }
+    // Against the floor this account can actually reach, not the configured
+    // one: a batch whose credit line is below `min_cheque_plur` would
+    // otherwise be refused for a cheque it is structurally incapable of
+    // writing (§10.1, `Params::effective`).
+    let floor = m.cfg.params.effective(verified.cap_plur).min_cheque_plur;
+    if cumulative - have < floor {
+        return json_line_response(
+            StatusCode::BAD_REQUEST,
+            &format!(
+                "cheque credits {} but the dust floor is {floor}",
+                cumulative - have,
+            ),
+        );
+    }
+    // Every free check has passed; only now does this cost RPC.
+    match m.is_deployed(&state.opts.rpc_url, cheque.chequebook).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return json_line_response(
+                StatusCode::BAD_REQUEST,
+                "chequebook was not deployed by the canonical factory",
+            );
+        }
+        Err(e) => return json_line_response(StatusCode::BAD_GATEWAY, &e),
+    }
+    let issuer_ok = crate::signer::recover_cheque_issuer(
+        &cheque.chequebook,
+        &cheque.beneficiary,
+        cheque.cumulative_payout,
+        m.cfg.chain_id,
+        &cheque.signature,
+    );
+    let recovered = match issuer_ok {
+        Ok(a) => a,
+        Err(e) => return json_line_response(StatusCode::BAD_REQUEST, &e.to_string()),
+    };
+    let cb_state = match m
+        .chequebook_state(&state.opts.rpc_url, cheque.chequebook)
+        .await
+    {
+        Ok(s) => s,
+        Err(e) => return json_line_response(StatusCode::BAD_GATEWAY, &e),
+    };
+    if cb_state.bounced {
+        return json_line_response(
+            StatusCode::BAD_REQUEST,
+            "chequebook has bounced a cheque before and is refused",
+        );
+    }
+    if cb_state.issuer.into_array() != recovered {
+        return json_line_response(
+            StatusCode::BAD_REQUEST,
+            "cheque was not signed by the issuer",
+        );
+    }
+    if cb_state.issuer.into_array() != verified.account {
+        return json_line_response(
+            StatusCode::BAD_REQUEST,
+            "chequebook issuer is not the account that owns this batch",
+        );
+    }
+    // The funding check, against `liquidBalanceFor(us)` rather than
+    // `balance()` — the latter counts other beneficiaries' hard deposits as
+    // our coverage, which is unsound (§11.2).
+    let paid_out = u128::try_from(cb_state.paid_out_to_us).unwrap_or(u128::MAX);
+    let liquid = u128::try_from(cb_state.liquid_for_us).unwrap_or(u128::MAX);
+    if liquid < cumulative.saturating_sub(paid_out) {
+        return json_line_response(
+            StatusCode::BAD_REQUEST,
+            "chequebook cannot cover this cheque",
+        );
+    }
+    match m.credit(
+        verified.account,
+        cheque.chequebook,
+        cumulative,
+        cheque.signature,
+    ) {
+        Ok(accepted) => {
+            // We just consumed part of what that balance covered; the next
+            // cheque should not be judged against the pre-credit reading.
+            m.invalidate_chequebook(&cheque.chequebook);
+            let l = m.ledger.lock().expect("ledger poisoned");
+            json_response(
+                StatusCode::OK,
+                &serde_json::json!({
+                    "accepted_plur": accepted.to_string(),
+                    "cumulative": cumulative.to_string(),
+                    "owed_plur": l.owed(&verified.account).to_string(),
+                    "outstanding_plur": l.outstanding(&verified.account).to_string(),
+                }),
+            )
+        }
+        Err(crate::ledger::LedgerError::Store(e)) => {
+            tracing::error!("ledger persist after credit failed: {e}");
+            json_line_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "ledger write failed; re-present the same cheque",
+            )
+        }
+        Err(e) => json_line_response(StatusCode::BAD_REQUEST, &e.to_string()),
+    }
+}
+
+/// `GET /v1/account` — the client's own ledger row (§7).
+///
+/// Authenticated with the challenge header: unauthenticated it is a
+/// per-identity volume oracle over on-chain-enumerable batch owners, and a
+/// targeting oracle for tipping a victim into 402 at a chosen moment.
+fn account_response(state: &State, headers: &hyper::HeaderMap) -> Response<RespBody> {
+    let Some(m) = state.metered.as_ref() else {
+        return json_line_response(StatusCode::NOT_FOUND, "relay is not metered");
+    };
+    let raw = headers
+        .get(crate::challenge::CHALLENGE_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    let verified = match m.verify_header(raw, crate::challenge::now_unix()) {
+        Ok(v) => v,
+        Err(e) => return json_line_response(StatusCode::UNAUTHORIZED, &e),
+    };
+    let l = m.ledger.lock().expect("ledger poisoned");
+    // Report the *effective* thresholds for this account's line, not the
+    // configured ones: `/v1/pay` enforces `effective(cap)`, and a client
+    // following the configured numbers would wait for a settlement it can
+    // never reach on a small batch (the case `Params::effective` exists for).
+    let eff = m.cfg.params.effective(verified.cap_plur);
+    json_response(
+        StatusCode::OK,
+        &serde_json::json!({
+            "account": format!("0x{}", hex::encode(verified.account)),
+            "owed_plur": l.owed(&verified.account).to_string(),
+            "reserved_plur": l.reserved(&verified.account).to_string(),
+            "outstanding_plur": l.outstanding(&verified.account).to_string(),
+            "max_outstanding_plur": verified.cap_plur.to_string(),
+            "settle_every_plur": eff.settle_every_plur.to_string(),
+            "min_cheque_plur": eff.min_cheque_plur.to_string(),
+        }),
+    )
+}
+
+/// Read a request body with a hard cap, so an oversized one costs nothing.
+async fn read_body_limited(
+    req: Request<hyper::body::Incoming>,
+    max: usize,
+) -> Result<Bytes, Response<RespBody>> {
+    use http_body_util::BodyExt;
+    use hyper::body::Body as _;
+    use std::time::Duration;
+    // Cheap rejection when the client declares an oversize body up front.
+    // This is an optimisation, NOT the bound: `size_hint().upper()` is
+    // `None` for a chunked body (and for HTTP/2, where length is unknown
+    // until END_STREAM), so a client that omits `Content-Length` skips it
+    // entirely.
+    if let Some(len) = req.body().size_hint().upper()
+        && len > max as u64
+    {
+        return Err(json_line_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "body too large",
+        ));
+    }
+    // The real bound. `Limited` enforces the cap *inside* `poll_frame`, so
+    // memory is held to `max` plus one frame. A bare `.collect()` would
+    // accumulate whatever the client streams until the timeout fires —
+    // ~30 s of link bandwidth per connection, times the connection cap —
+    // and only notice afterwards, which is no bound at all.
+    match tokio::time::timeout(
+        Duration::from_secs(HEADER_READ_TIMEOUT_SECS),
+        Limited::new(req.into_body(), max).collect(),
+    )
+    .await
+    {
+        Ok(Ok(c)) => {
+            let b = c.to_bytes();
+            if b.len() > max {
+                return Err(json_line_response(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "body too large",
+                ));
+            }
+            Ok(b)
+        }
+        Ok(Err(_)) => Err(json_line_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "body exceeds limit or read error",
+        )),
+        Err(_) => Err(json_line_response(
+            StatusCode::REQUEST_TIMEOUT,
+            "body read timed out",
+        )),
+    }
+}
+
+fn parse_hex_array<const N: usize>(s: &str) -> Result<[u8; N], String> {
+    let raw = hex::decode(s.trim_start_matches("0x")).map_err(|e| e.to_string())?;
+    if raw.len() != N {
+        return Err(format!("must be {N} bytes, got {}", raw.len()));
+    }
+    let mut out = [0u8; N];
+    out.copy_from_slice(&raw);
+    Ok(out)
+}
+
+/// Body of a maximal POST, for the credit-line comparison in `src/meter.rs`:
+/// a batch whose line is under this has to split its uploads across smaller
+/// requests (incentives §7.2).
+fn full_post_kib() -> u64 {
+    (PUSH_BATCH_MAX * pushframe::MAX_FRAME_LEN).div_ceil(1024) as u64
+}
+
+/// Completed per-stream push outcomes since boot.
+///
+/// Incentives §9.1 reads this over frames admitted as an egress multiplier,
+/// and **it undercounts**: the counters are bumped after the await inside
+/// the racing future (`src/client.rs:5818-5870`), and the dispatcher
+/// cancels the losing racers as soon as it takes a receipt
+/// (`src/client.rs:4806-4809`). A cancelled racer has already put its
+/// Delivery on the wire — the relay pays that egress — but never reaches
+/// the increment. Shallow retries and errors are counted; concurrent
+/// losers are not, so the ratio floors near 1.0 whenever the race is won
+/// promptly. Counting at dispatch, beside `inflight_pushes`, would fix it.
+fn stream_attempts() -> u64 {
+    use crate::transport::diag;
+    use std::sync::atomic::Ordering;
+    diag::PUSH_OUTCOME_OK.load(Ordering::Relaxed)
+        + diag::PUSH_OUTCOME_SHALLOW.load(Ordering::Relaxed)
+        + diag::PUSH_OUTCOME_OVERDRAFT.load(Ordering::Relaxed)
+        + diag::PUSH_OUTCOME_ERROR.load(Ordering::Relaxed)
+}
+
+/// `GET /v1/meter` — Stage 0 shadow-metering detail (incentives §14).
+///
+/// **Open by default; set `HOVERFLY_PUSH_METER_TOKEN` to require a bearer
+/// token.** Stage 0's rows are derived from state that is already public:
+/// batch owners and their balances are on-chain and enumerable from
+/// `BatchCreated`, and the stamp on every relayed chunk names its batch,
+/// which retrieval hands back (incentives §2). All this endpoint adds is
+/// relay attribution and timing, so gating it by default buys little and
+/// costs a lot — an instrument nobody reads answers no questions, and
+/// deciding whether to meter at all is the only reason Stage 0 exists.
+///
+/// That flips at **Stage 1**, and the reason is worth recording because it
+/// is not the obvious one. Once 402s are live, `/v1/account` exposes an
+/// account's *outstanding* balance, which lets a reader time a stamp replay
+/// (§11.1) to tip a victim over its cap mid-upload. That is an active
+/// attack enabler rather than a privacy leak, and it is the real reason
+/// incentives §7 authenticates that endpoint.
+fn meter_response(state: &State, headers: &hyper::HeaderMap) -> Response<RespBody> {
+    if let Ok(want) = std::env::var("HOVERFLY_PUSH_METER_TOKEN") {
+        let got = headers
+            .get(hyper::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .unwrap_or_default();
+        // Compare the *contents* in constant time — a byte-wise early exit
+        // would let the token be ground out one character at a time. Length
+        // is compared directly and so is observable, which is fine: it is a
+        // static property of the operator's config, not something an
+        // attacker can narrow down to a value.
+        let ok = got.len() == want.len()
+            && got
+                .bytes()
+                .zip(want.bytes())
+                .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+                == 0;
+        if !ok {
+            return json_line_response(StatusCode::UNAUTHORIZED, "unauthorized");
+        }
+    }
+    let body =
+        state
+            .meter
+            .lock()
+            .expect("meter poisoned")
+            .detail(full_post_kib(), stream_attempts(), 100);
+    json_response(StatusCode::OK, &body)
 }
 
 /// Add permissive CORS headers to a response.
@@ -333,7 +1198,7 @@ fn cors_preflight() -> Response<RespBody> {
     );
     h.insert(
         "access-control-allow-headers",
-        HeaderValue::from_static("content-type"),
+        HeaderValue::from_static("content-type, x-hoverfly-challenge"),
     );
     h.insert("access-control-max-age", HeaderValue::from_static("86400"));
     resp
@@ -377,6 +1242,20 @@ fn status_response(state: &State) -> Response<RespBody> {
         // log-only, so a deployed relay can be inspected without shell
         // access to it.
         "diag": diag::summary(),
+        // Stage 0 shadow metering (incentives §14): what a metered relay
+        // *would* have billed. Nothing is charged and no client behaviour
+        // changes. Aggregates only — per-account detail is behind
+        // /v1/meter, since it names identities (see `meter_response`).
+        // Metered-mode quote (§7.3), signed with the node-identity key so a
+        // price is not repudiable in either direction. Absent in open mode.
+        "payment": payment_quote(state),
+        "meter": state.push.as_ref().map(|_| {
+            state
+                .meter
+                .lock()
+                .expect("meter poisoned")
+                .summary(full_post_kib(), stream_attempts())
+        }),
     });
     json_response(StatusCode::OK, &body)
 }
@@ -592,6 +1471,7 @@ fn build_push_state(opts: &PusherOpts) -> Option<PushState> {
     };
     let keypair = crate::inbound::libp2p_keypair_from_identity(&node_signer);
     let overlay = *node_signer.overlay();
+    let quote_signer = node_signer.clone();
     let snapshot = crate::protocols::status::StatusSnapshot::default();
     let transport = Transport::new_with_keypair(node_signer, opts.transport.clone(), keypair)
         .with_status_snapshot(snapshot);
@@ -619,6 +1499,7 @@ fn build_push_state(opts: &PusherOpts) -> Option<PushState> {
         pool: tokio::sync::Mutex::new(None),
         pool_target,
         pool_live: AtomicUsize::new(0),
+        signer: quote_signer,
         overlay,
         budget_gb,
         bytes_pushed: AtomicU64::new(0),
@@ -646,14 +1527,32 @@ async fn push_response(
             "push disabled (no node identity resolvable)",
         );
     }
-    // Bounded body read — a whole batch, not a stream.
-    let bytes = match Limited::new(req.into_body(), PUSH_MAX_BODY).collect().await {
-        Ok(c) => c.to_bytes(),
-        Err(_) => {
+    // Metered admission, entirely before the body is read (§7.2). Nothing
+    // here touches the chain: the challenge already carries the credit line,
+    // which is the point of issuing it.
+    let admitted = match admit_metered(&state, &req) {
+        Ok(a) => a,
+        Err(resp) => return *resp,
+    };
+    // Bounded body read — a whole batch, not a stream. Bounded in *time* as
+    // well as size: the size limit alone let a client dribble a body forever
+    // and hold the connection (and, under metering, its admission
+    // reservation) for free.
+    let read = tokio::time::timeout(
+        std::time::Duration::from_secs(PUSH_BODY_READ_TIMEOUT_SECS),
+        Limited::new(req.into_body(), PUSH_MAX_BODY).collect(),
+    )
+    .await;
+    let bytes = match read {
+        Ok(Ok(c)) => c.to_bytes(),
+        Ok(Err(_)) => {
             return json_line_response(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "body exceeds limit or read error",
             );
+        }
+        Err(_) => {
+            return json_line_response(StatusCode::REQUEST_TIMEOUT, "body read timed out");
         }
     };
     let chunks = match pushframe::decode_batch(&bytes, PUSH_BATCH_MAX) {
@@ -673,7 +1572,7 @@ async fn push_response(
     // sessions from it (maintain=false), so no per-push dial burst.
     let (tx, rx) = futures::channel::mpsc::unbounded::<Result<Frame<Bytes>, Infallible>>();
     tokio::spawn(async move {
-        run_push(state, chunks, tx).await;
+        run_push(state, chunks, tx, admitted).await;
     });
 
     Response::builder()
@@ -689,6 +1588,7 @@ async fn run_push(
     state: Arc<State>,
     chunks: Vec<StampedChunk>,
     tx: futures::channel::mpsc::UnboundedSender<Result<Frame<Bytes>, Infallible>>,
+    admitted: Option<Admitted>,
 ) {
     let push = state.push.as_ref().expect("push state present");
     let mut dedup_hits = 0usize;
@@ -704,31 +1604,37 @@ async fn run_push(
         }
         send_line(&v);
     };
-    let ack_ok = |addr: &[u8; 32], info: crate::client::PushInfo| {
-        // `po` is the proximity order of the peer whose receipt we took —
-        // i.e. how deep into the chunk's own neighborhood it actually
-        // landed. This is the measurement that decides whether client-side
-        // proximity routing to a relay's overlay is worth anything at all
-        // (docs/pusher-design.md §7); without it that question can only be
-        // guessed at.
-        let mut v = serde_json::json!({
-            "a": hex::encode(addr),
-            "s": "ok",
-            "po": info.po,
-            "ms": info.ms,
-        });
-        if info.shallow {
-            v["shallow"] = serde_json::Value::Bool(true);
-        }
-        send_line(&v);
+    let ack_dedup = |addr: &[u8; 32]| {
+        // A dedup hit did no push work and is billed at zero (§8.2). Say so
+        // explicitly: without a marker it is indistinguishable from a real
+        // push, so a paying client counts bytes the relay never charged
+        // for, and its next cheque is refused as an overpayment. The claim
+        // only ever *lowers* what is owed, so it is safe for the client to
+        // take at face value.
+        send_line(&serde_json::json!({
+            "a": hex::encode(addr), "s": "ok", "po": 0, "ms": 0, "dedup": true
+        }));
     };
 
     // The stamp's batch_id must match the on-chain owner the signature
     // recovers to. All chunks in one upload share a batch; verify the
     // batch once, then check each chunk's recovered signer against it.
     let mut accepted: Vec<StampedChunk> = Vec::with_capacity(chunks.len());
-    let mut batch_owner: Option<[u8; 20]> = None;
+    let mut batch_owner: Option<([u8; 20], u128)> = None;
     let mut batch_hex: Option<String> = None;
+    // Stage 0 shadow metering, accumulated on this task's stack and merged
+    // once below. Per-frame locking would serialize concurrent POSTs on a
+    // counter nobody is billed from.
+    let mut tally = crate::meter::PostTally::default();
+    // Body bytes that will actually be billed: admitted minus dedup hits,
+    // which did no push work and so cost nothing (§8.2).
+    let mut billable_bytes: u64 = 0;
+    // addr -> owning batch, for the recent-ack cache: dedup must be
+    // scoped per (addr, batch) so one uploader's frame can't be acked
+    // "ok" under another uploader's stamp (§15).
+    let mut batch_of: HashMap<[u8; 32], [u8; 32]> = HashMap::with_capacity(chunks.len());
+    // Distinct on-chain batch resolutions this request may perform.
+    let mut rpc_budget = PUSH_MAX_BATCH_LOOKUPS;
 
     for chunk in chunks {
         let vs = match crate::stamp::validate(&chunk.addr, &chunk.stamp) {
@@ -743,7 +1649,7 @@ async fn run_push(
         let owner = if batch_hex.as_deref() == Some(bid.as_str()) {
             batch_owner
         } else {
-            match resolve_owner(&state, &bid).await {
+            match resolve_owner(&state, &bid, &mut rpc_budget).await {
                 Ok(o) => {
                     batch_hex = Some(bid.clone());
                     batch_owner = Some(o);
@@ -756,32 +1662,58 @@ async fn run_push(
             }
         };
         match owner {
-            Some(o) if o == vs.signer => {
+            Some((o, batch_value)) if o == vs.signer => {
                 // Duplicate suppression: a client hedging a straggler
                 // sends the same frame to two lanes on purpose. Answering
                 // from the recent-ack cache makes the loser of that race
                 // free instead of a second real push through the pool.
+                // Scoped per (addr, batch) — a bare address would let the
+                // hit discard the submitted stamp (§15).
+                let mut batch_id = [0u8; 32];
+                batch_id.copy_from_slice(vs.batch_id);
+                // One batch per request under metering (§6). Standing, the
+                // credit line and the reservation are all properties of a
+                // *batch*, so a POST that mixes them lets one good-standing
+                // frame carry 511 others from an account that is over its
+                // cap (§11.8). Rejected rather than billed to whoever it
+                // names.
+                if let Some(adm) = &admitted
+                    && batch_id != adm.batch
+                {
+                    ack(
+                        &chunk.addr,
+                        "err",
+                        Some("frame batch does not match the challenge (one batch per request)"),
+                    );
+                    continue;
+                }
+                // Body bytes this frame occupied — header plus wire — which
+                // is the unit incentives §8 bills. Recorded for every
+                // admitted frame, dedup hits included, because the relay
+                // received those bytes either way.
+                let key = crate::meter::AccountBatch {
+                    owner: o,
+                    batch: batch_id,
+                };
+                let frame_bytes = (pushframe::HEADER_LEN + chunk.wire.len()) as u64;
+                tally.admit(key, batch_value, frame_bytes);
+                billable_bytes += frame_bytes;
                 let dup = push
                     .recent
                     .lock()
                     .expect("recent-ack cache poisoned")
-                    .contains(&chunk.addr);
+                    .contains(&chunk.addr, batch_id);
                 if dup {
                     dedup_hits += 1;
-                    ack_ok(
-                        &chunk.addr,
-                        crate::client::PushInfo {
-                            po: 0,
-                            ms: 0,
-                            shallow: false,
-                            best_po: 0,
-                        },
-                    );
+                    tally.dedup(key, batch_value, frame_bytes);
+                    billable_bytes = billable_bytes.saturating_sub(frame_bytes);
+                    ack_dedup(&chunk.addr);
                 } else {
+                    batch_of.insert(chunk.addr, batch_id);
                     accepted.push(chunk);
                 }
             }
-            Some(o) => ack(
+            Some((o, _)) => ack(
                 &chunk.addr,
                 "err",
                 Some(&format!(
@@ -792,6 +1724,25 @@ async fn run_push(
             ),
             None => ack(&chunk.addr, "err", Some("batch owner unresolved")),
         }
+    }
+
+    // Turn the reservation into debt for what was actually admitted, and
+    // release the rest (§10.2). Runs before the early return below, so a
+    // POST that admitted nothing still gives its reservation back — leaking
+    // it would ratchet the account toward a 402 it can never clear.
+    if let Some(adm) = admitted {
+        adm.commit(billable_bytes);
+    }
+
+    // One lock for the whole request. Runs before the early return below so
+    // an all-dedup POST is still measured — those are exactly the requests
+    // §8.2 bills at zero, and their share is a number Stage 0 wants.
+    if !tally.is_empty() {
+        state
+            .meter
+            .lock()
+            .expect("meter poisoned")
+            .merge(std::mem::take(&mut tally));
     }
 
     if accepted.is_empty() {
@@ -833,6 +1784,13 @@ async fn run_push(
         Arc::new(move |addr: &[u8; 32], res| {
             let v = match &res {
                 Ok(info) => {
+                    // `po` is the proximity order of the peer whose receipt
+                    // we took — how deep into the chunk's own neighborhood
+                    // it actually landed. This is the measurement that
+                    // decides whether client-side proximity routing to a
+                    // relay's overlay is worth anything at all
+                    // (docs/pusher-design.md §7); without it that question
+                    // can only be guessed at.
                     let mut v = serde_json::json!({
                         "a": hex::encode(addr), "s": "ok", "po": info.po, "ms": info.ms,
                         // Best proximity the dispatcher could reach for this
@@ -880,10 +1838,15 @@ async fn run_push(
     for (a, ok) in &seen {
         if *ok {
             pushed += 1;
+            // A successful chunk belongs to exactly the batch it was
+            // admitted under; cache it under (addr, batch) so dedup stays
+            // scoped. `batch_of` is only missing a key if the chunk was
+            // admitted on a path that never mapped it — none currently.
+            let bid = batch_of.get(a).copied().unwrap_or([0u8; 32]);
             push.recent
                 .lock()
                 .expect("recent-ack cache poisoned")
-                .insert(*a);
+                .insert(*a, bid);
         }
     }
     if total > 0 {
@@ -919,43 +1882,93 @@ async fn run_push(
 /// is "the batch is alive" (docs/pusher-design.md §5), so a batch whose
 /// `remainingBalance` has drained to zero is rejected — bee nodes would
 /// refuse its stamps anyway, and pushing them just burns relay egress.
-/// The aliveness read happens once per batch (the cache never expires);
-/// a batch that dies *while cached* only wastes its own push attempts —
-/// bees reject the stamps downstream — and a pusher restart re-checks.
-async fn resolve_owner(state: &State, batch_id_hex: &str) -> Result<[u8; 20], String> {
-    if let Some(o) = state
+/// The aliveness read happens once per batch and is cached for
+/// `OWNER_OK_TTL_SECS`; a batch that dies *while cached* only wastes its
+/// own push attempts — bees reject the stamps downstream.
+/// `rpc_budget` bounds how many *distinct* batch ids one request may push
+/// through to the chain. A cache hit never spends it; only a genuine miss
+/// does. Without it, negative caching alone still leaves a single POST
+/// naming `PUSH_BATCH_MAX` different bogus batch ids able to issue that
+/// many serial `eth_call`s, since every one of them is a first miss.
+async fn resolve_owner(
+    state: &State,
+    batch_id_hex: &str,
+    rpc_budget: &mut usize,
+) -> Result<([u8; 20], u128), String> {
+    if let Some(hit) = state
         .owner_cache
         .lock()
         .expect("owner cache poisoned")
         .get(batch_id_hex)
     {
-        return Ok(*o);
+        return match hit {
+            OwnerLookup::Owner(o, value) => Ok((o, value)),
+            OwnerLookup::Rejected(why) => Err(why),
+        };
     }
+    if *rpc_budget == 0 {
+        return Err(format!(
+            "batch {batch_id_hex}: too many distinct batches in one request \
+             (limit {PUSH_MAX_BATCH_LOOKUPS}); split them across requests"
+        ));
+    }
+    *rpc_budget -= 1;
+
+    // Only *definitive* on-chain answers are cached. A transport error must
+    // not blacklist a live batch for OWNER_BAD_TTL_SECS, so those propagate
+    // uncached.
     let stamp_addr: alloy_primitives::Address = crate::batch::MAINNET_POSTAGE_STAMP
         .parse()
         .expect("hardcoded valid");
     let info = crate::batch::read_batch(&state.opts.rpc_url, stamp_addr, batch_id_hex)
         .await
         .map_err(|e| format!("batch owner RPC: {e}"))?;
+    let reject = |state: &State, why: String| -> String {
+        state
+            .owner_cache
+            .lock()
+            .expect("owner cache poisoned")
+            .insert(batch_id_hex, OwnerLookup::Rejected(why.clone()));
+        why
+    };
     if info.not_found {
-        return Err(format!("batch {batch_id_hex} not found on-chain"));
+        return Err(reject(
+            state,
+            format!("batch {batch_id_hex} not found on-chain"),
+        ));
     }
     let remaining =
         crate::batch::read_remaining_balance(&state.opts.rpc_url, stamp_addr, batch_id_hex)
             .await
             .map_err(|e| format!("batch balance RPC: {e}"))?;
     if remaining.is_zero() {
-        return Err(format!(
-            "batch {batch_id_hex} has expired (zero remaining balance) — bees would reject every stamp"
+        return Err(reject(
+            state,
+            format!(
+                "batch {batch_id_hex} has expired (zero remaining balance) — bees would reject every stamp"
+            ),
         ));
     }
+    // Total value still funded on this batch: `remainingBalance` is PLUR per
+    // chunk, and a batch of depth `d` covers 2^d chunks (incentives §6).
+    // Saturating rather than wrapping — a nonsense depth from a malformed
+    // read must not produce a small number that looks like a real answer.
+    let depth_factor = 1u128
+        .checked_shl(u32::from(info.depth))
+        .unwrap_or(u128::MAX);
+    let remaining_value_plur = u128::try_from(remaining)
+        .unwrap_or(u128::MAX)
+        .saturating_mul(depth_factor);
     let owner = info.owner.into_array();
     state
         .owner_cache
         .lock()
         .expect("owner cache poisoned")
-        .insert(batch_id_hex.to_string(), owner);
-    Ok(owner)
+        .insert(
+            batch_id_hex,
+            OwnerLookup::Owner(owner, remaining_value_plur),
+        );
+    Ok((owner, remaining_value_plur))
 }
 
 /// Return the warm pool, filling/topping it up to `push.pool_target`.
@@ -1408,4 +2421,139 @@ fn json_response(status: StatusCode, body: &serde_json::Value) -> Response<RespB
 
 fn json_line_response(status: StatusCode, message: &str) -> Response<RespBody> {
     json_response(status, &serde_json::json!({"error": message}))
+}
+
+/// The signed `payment` block for `/v1/status` (incentives §7.3).
+///
+/// An unsigned price is repudiable in both directions: the relay can serve
+/// `P` and bill `10P`, the client can claim it saw `P/10`, and
+/// reconciliation can detect the mismatch but never attribute it.
+///
+/// It carries `node_eth_address` and `overlay_nonce` because
+/// "pin `(url, overlay)`" is not implementable — an overlay is
+/// `keccak(eth_addr ‖ network_id_LE8 ‖ nonce)`, so verifying a signature
+/// yields the *eth address* while the nonce is neither transmitted nor
+/// derivable. With both present a client can recompute the overlay and
+/// check it against what the relay advertises, and pin the triple
+/// `(url, node_eth_address, beneficiary)`.
+fn payment_quote(state: &State) -> Option<serde_json::Value> {
+    let m = state.metered.as_ref()?;
+    let push = state.push.as_ref()?;
+    let p = &m.cfg.params;
+    // `origin` advertises the first configured hostname: issuance binds
+    // only that one (`origins.first()`), while verification accepts any
+    // configured origin. Extra `--origin` values are accept-list entries
+    // for multi-host relays, not separately advertised lines.
+    // `quote_valid_secs` is how long the client may treat this quote as
+    // current without re-reading `/v1/status` (§7.2/§11.9): 24 h, which
+    // exceeds one settlement period (§10.1 sizes ~32 MiB per window).
+    let mut body = serde_json::json!({
+        "mode": "metered",
+        "enforcement": if m.cfg.hard_mode { "hard" } else { "soft" },
+        "beneficiary": format!("0x{}", hex::encode(m.cfg.beneficiary)),
+        "node_eth_address": format!("0x{}", hex::encode(push.signer.eth_address())),
+        "overlay_nonce": format!("0x{}", hex::encode(state.opts.nonce)),
+        "origin": m.cfg.origins.first().cloned().unwrap_or_default(),
+        "chain_id": m.cfg.chain_id,
+        "factory": format!("0x{}", hex::encode(m.cfg.factory)),
+        "price_plur_per_kib": p.price_plur_per_kib.to_string(),
+        "min_cheque_plur": p.min_cheque_plur.to_string(),
+        "settle_every_plur": p.settle_every_plur.to_string(),
+        "max_outstanding_plur": p.max_outstanding_plur.to_string(),
+        "credit_ratio": p.credit_ratio,
+        "challenge_ttl_secs": crate::challenge::CHALLENGE_TTL_SECS,
+        "quote_valid_secs": 86_400,
+    });
+    // Sign the canonical serialization of the block itself, so what the
+    // client verifies is exactly what it read.
+    let payload = body.to_string();
+    match push.signer.sign_eip191(payload.as_bytes()) {
+        Ok(sig) => {
+            body["sig"] = serde_json::Value::String(format!("0x{}", hex::encode(sig)));
+            Some(body)
+        }
+        Err(e) => {
+            tracing::error!("cannot sign payment quote: {e}");
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod owner_cache_tests {
+    use super::*;
+
+    fn owner_of(c: &OwnerCache, k: &str) -> Option<[u8; 20]> {
+        match c.get(k) {
+            Some(OwnerLookup::Owner(o, _)) => Some(o),
+            _ => None,
+        }
+    }
+
+    fn value_of(c: &OwnerCache, k: &str) -> Option<u128> {
+        match c.get(k) {
+            Some(OwnerLookup::Owner(_, v)) => Some(v),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn rejections_are_cached_so_a_bogus_batch_is_not_re_resolved() {
+        let mut c = OwnerCache::new(16);
+        assert!(c.get("deadbeef").is_none(), "cold cache must miss");
+        c.insert("deadbeef", OwnerLookup::Rejected("not found".into()));
+        // The point of the fix: a second frame naming the same bogus batch
+        // finds a cached rejection instead of issuing another eth_call.
+        assert!(
+            matches!(c.get("deadbeef"), Some(OwnerLookup::Rejected(w)) if w == "not found"),
+            "rejection must be cached"
+        );
+    }
+
+    /// The batch's remaining value rides along on the cached success so
+    /// Stage 0 can price a credit line without a second `eth_call`
+    /// (`src/meter.rs`). A cache that dropped it would silently make every
+    /// batch look unpriced.
+    #[test]
+    fn the_cached_success_carries_the_batch_value() {
+        let mut c = OwnerCache::new(16);
+        c.insert("b0", OwnerLookup::Owner([7u8; 20], 100_000_000_000_000));
+        assert_eq!(owner_of(&c, "b0"), Some([7u8; 20]));
+        assert_eq!(value_of(&c, "b0"), Some(100_000_000_000_000));
+    }
+
+    #[test]
+    fn eviction_is_bounded_by_cap() {
+        let mut c = OwnerCache::new(4);
+        for i in 0..64 {
+            c.insert(&format!("batch{i}"), OwnerLookup::Owner([i as u8; 20], 0));
+        }
+        assert_eq!(c.map.len(), 4, "map must stay at cap");
+        assert_eq!(c.order.len(), 4, "order must stay at cap");
+        assert!(owner_of(&c, "batch0").is_none(), "oldest evicted");
+        assert_eq!(owner_of(&c, "batch63"), Some([63u8; 20]), "newest retained");
+    }
+
+    #[test]
+    fn reinserting_a_key_does_not_grow_the_order_queue() {
+        let mut c = OwnerCache::new(8);
+        for _ in 0..32 {
+            c.insert("same", OwnerLookup::Owner([1u8; 20], 0));
+        }
+        assert_eq!(c.order.len(), 1, "one order slot per distinct key");
+        assert_eq!(owner_of(&c, "same"), Some([1u8; 20]));
+    }
+
+    #[test]
+    fn entries_expire() {
+        // Zero-length TTLs are not reachable through the constants, so drive
+        // expiry by backdating the insert instant directly.
+        let mut c = OwnerCache::new(8);
+        c.insert("stale", OwnerLookup::Owner([2u8; 20], 0));
+        let aged = Instant::now()
+            .checked_sub(std::time::Duration::from_secs(OWNER_OK_TTL_SECS + 1))
+            .expect("clock supports backdating");
+        c.map.get_mut("stale").expect("present").1 = aged;
+        assert!(c.get("stale").is_none(), "expired entry must not be served");
+    }
 }

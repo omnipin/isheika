@@ -453,6 +453,16 @@ pub fn recover_eth_address_from_handshake_v15(
     recover_eth_from_eip191(&payload, signature)
 }
 
+/// Public wrapper over [`recover_eth_from_eip191`], for verifying the
+/// relay's signed price quote client-side (`docs/pusher-incentives.md`
+/// §7.3). An unsigned price is repudiable in both directions.
+pub fn recover_eth_address_from_eip191(
+    payload: &[u8],
+    signature: &[u8],
+) -> Result<[u8; 20], SignerError> {
+    recover_eth_from_eip191(payload, signature)
+}
+
 /// Recover the 20-byte Ethereum address from a 65-byte (r || s || v)
 /// EIP-191 signature over `payload`. `v` is expected in Ethereum form
 /// (27 or 28); k256 normalises to 0/1 internally.
@@ -497,4 +507,320 @@ fn recover_eth_from_eip191(payload: &[u8], signature: &[u8]) -> Result<[u8; 20],
     let mut addr = [0u8; 20];
     addr.copy_from_slice(&hash[12..]);
     Ok(addr)
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Metered relay (docs/pusher-incentives.md Stage 1)
+// ──────────────────────────────────────────────────────────────────────
+
+/// secp256k1n ÷ 2. `ERC20SimpleSwap.recoverEIP712` calls `ECDSA.recover`
+/// from `@openzeppelin/contracts/cryptography/ECDSA.sol` at `^3.4.1`, which
+/// requires `uint256(s) <= this` and `v ∈ {27, 28}` — so a signature outside
+/// that range is *off-chain valid and on-chain uncashable*. See incentives
+/// §11.6; rejecting it at the boundary is what stops a client buying service
+/// with a cheque that can never be redeemed.
+const SECP256K1N_HALF: [u8; 32] = [
+    0x7F, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    0x5D, 0x57, 0x6E, 0x73, 0x57, 0xA4, 0x50, 0x1D, 0xDF, 0xE9, 0x2F, 0x46, 0x68, 0x1B, 0x20, 0xA0,
+];
+
+/// Reject a signature the deployed chequebook would refuse to honour.
+///
+/// This is a *validity* check, not a malleability nicety. `alloy` recovers
+/// high-`s` and `v ∈ {0,1}` happily, so without this the relay accepts
+/// cheques it can never cash.
+pub fn check_canonical_signature(sig: &[u8]) -> Result<(), SignerError> {
+    if sig.len() != 65 {
+        return Err(SignerError::Alloy(format!(
+            "signature must be 65 bytes, got {}",
+            sig.len()
+        )));
+    }
+    if sig[64] != 27 && sig[64] != 28 {
+        return Err(SignerError::Alloy(format!(
+            "non-canonical v={}: ERC20SimpleSwap requires 27 or 28, so this \
+             cheque would revert at cashout",
+            sig[64]
+        )));
+    }
+    // Both are big-endian 32-byte magnitudes, so a lexicographic slice
+    // compare is a numeric compare.
+    if sig[32..64] > SECP256K1N_HALF[..] {
+        return Err(SignerError::Alloy(
+            "non-canonical high-s signature: ERC20SimpleSwap rejects \
+             s > secp256k1n/2, so this cheque would revert at cashout"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// The EIP-712 domain bee uses for cheques. Extracted so signing and
+/// recovery cannot drift: a mismatched domain silently recovers a
+/// *different* address rather than failing, which would look like "the
+/// client signed with the wrong key".
+pub fn chequebook_domain(chain_id: u64) -> Eip712Domain {
+    Eip712Domain {
+        name: Some("Chequebook".into()),
+        version: Some("1.0".into()),
+        chain_id: Some(alloy_primitives::U256::from(chain_id)),
+        verifying_contract: None,
+        salt: None,
+    }
+}
+
+/// Domain for the relay's own admission challenge (incentives §7.2).
+///
+/// Separate from `Chequebook` on purpose: the account key already signs
+/// postage stamps (EIP-191 over raw stamp bytes) and cheques (EIP-712,
+/// `Chequebook`). A third scheme over the same key without its own domain
+/// invites cross-scheme confusion, where a signature gathered for one
+/// purpose is replayable as another.
+pub fn pusher_domain(chain_id: u64) -> Eip712Domain {
+    Eip712Domain {
+        name: Some("HoverflyPusher".into()),
+        version: Some("1".into()),
+        chain_id: Some(alloy_primitives::U256::from(chain_id)),
+        verifying_contract: None,
+        salt: None,
+    }
+}
+
+sol! {
+    /// Signed by the *client* to prove it holds the account key the relay
+    /// issued a challenge to. `origin` is the host the client dialled and is
+    /// what stops a signature gathered at relay A being replayed at relay B
+    /// (incentives §11.1) — but only if the relay compares it against its own
+    /// configured hostname rather than a request header.
+    struct PushChallenge {
+        bytes32 nonce;
+        string  origin;
+        address account;
+        bytes32 batchId;
+        uint256 expiry;
+    }
+}
+
+/// Recover the issuer of an EIP-712 cheque.
+///
+/// Mirrors bee's `RecoverCheque` (`chequestore.go:190`). Rejects
+/// non-canonical signatures first — a cheque the chain would refuse is not
+/// a cheque, however well it recovers locally.
+pub fn recover_cheque_issuer(
+    chequebook: &[u8; 20],
+    beneficiary: &[u8; 20],
+    cumulative_payout: alloy_primitives::U256,
+    chain_id: u64,
+    signature: &[u8],
+) -> Result<[u8; 20], SignerError> {
+    check_canonical_signature(signature)?;
+    let cheque = Cheque {
+        chequebook: alloy_primitives::Address::from(*chequebook),
+        beneficiary: alloy_primitives::Address::from(*beneficiary),
+        cumulativePayout: cumulative_payout,
+    };
+    recover_typed(&cheque, &chequebook_domain(chain_id), signature)
+}
+
+/// Recover the account that signed a `PushChallenge`.
+pub fn recover_push_challenge(
+    challenge: &PushChallenge,
+    chain_id: u64,
+    signature: &[u8],
+) -> Result<[u8; 20], SignerError> {
+    // The challenge is never cashed, so canonical form is not a *validity*
+    // requirement here — but accepting only one encoding per signature keeps
+    // the replay surface a single value rather than four.
+    check_canonical_signature(signature)?;
+    recover_typed(challenge, &pusher_domain(chain_id), signature)
+}
+
+fn recover_typed<T: alloy_sol_types::SolStruct>(
+    value: &T,
+    domain: &Eip712Domain,
+    signature: &[u8],
+) -> Result<[u8; 20], SignerError> {
+    use k256::ecdsa::{RecoveryId, Signature as K256Sig, VerifyingKey};
+    let digest = value.eip712_signing_hash(domain);
+    let v = signature[64] - 27;
+    let k_sig = K256Sig::from_slice(&signature[..64])
+        .map_err(|e| SignerError::Alloy(format!("k256 sig: {e}")))?;
+    let rec_id =
+        RecoveryId::try_from(v).map_err(|e| SignerError::Alloy(format!("recovery id: {e}")))?;
+    let vk = VerifyingKey::recover_from_prehash(digest.as_slice(), &k_sig, rec_id)
+        .map_err(|e| SignerError::Alloy(format!("recover: {e}")))?;
+    let point = vk.to_encoded_point(false);
+    let hash: [u8; 32] = Keccak256::digest(&point.as_bytes()[1..]).into();
+    let mut addr = [0u8; 20];
+    addr.copy_from_slice(&hash[12..]);
+    Ok(addr)
+}
+
+impl SwarmSigner {
+    /// Sign a `PushChallenge` (incentives §7.2). Client side.
+    pub fn sign_push_challenge(
+        &self,
+        challenge: &PushChallenge,
+        chain_id: u64,
+    ) -> Result<[u8; 65], SignerError> {
+        let sig = self
+            .inner
+            .sign_typed_data_sync(challenge, &pusher_domain(chain_id))
+            .map_err(|e| SignerError::Alloy(e.to_string()))?;
+        let mut bytes = sig.as_bytes();
+        if bytes[64] < 27 {
+            bytes[64] += 27;
+        }
+        Ok(bytes)
+    }
+}
+
+#[cfg(test)]
+mod metered_tests {
+    use super::*;
+
+    const KEY: &str = "0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318";
+
+    fn signer() -> SwarmSigner {
+        SwarmSigner::from_hex_with_nonce(KEY, &format!("0x{}", hex::encode([0u8; 32])), 1)
+            .expect("valid key")
+    }
+
+    #[test]
+    fn a_cheque_recovers_to_the_key_that_signed_it() {
+        let s = signer();
+        let cb = [0x11u8; 20];
+        let bn = [0x22u8; 20];
+        let amount = alloy_primitives::U256::from(1_000_000u64);
+        let sig = s.sign_cheque(&cb, &bn, amount, 100).expect("sign");
+        let got = recover_cheque_issuer(&cb, &bn, amount, 100, &sig).expect("recover");
+        assert_eq!(got, *s.eth_address(), "issuer must be the signing key");
+    }
+
+    /// The domain separator carries the chain id, so a cheque signed for
+    /// Gnosis must not validate against a relay pinning Sepolia — otherwise
+    /// one signature pays on every chain at once.
+    #[test]
+    fn a_cheque_does_not_recover_across_chains() {
+        let s = signer();
+        let (cb, bn) = ([0x11u8; 20], [0x22u8; 20]);
+        let amount = alloy_primitives::U256::from(7u64);
+        let sig = s.sign_cheque(&cb, &bn, amount, 100).expect("sign");
+        let other = recover_cheque_issuer(&cb, &bn, amount, 11155111, &sig).expect("recovers");
+        assert_ne!(
+            other,
+            *s.eth_address(),
+            "wrong chain must not recover the issuer"
+        );
+    }
+
+    /// Changing any signed field must move the recovered address, or the
+    /// relay could be paid with a cheque made out to someone else.
+    #[test]
+    fn a_cheque_binds_every_field() {
+        let s = signer();
+        let (cb, bn) = ([0x11u8; 20], [0x22u8; 20]);
+        let amount = alloy_primitives::U256::from(500u64);
+        let sig = s.sign_cheque(&cb, &bn, amount, 100).expect("sign");
+        let me = *s.eth_address();
+        assert_ne!(
+            recover_cheque_issuer(&cb, &[0x33u8; 20], amount, 100, &sig).expect("rec"),
+            me,
+            "beneficiary is bound"
+        );
+        assert_ne!(
+            recover_cheque_issuer(&[0x44u8; 20], &bn, amount, 100, &sig).expect("rec"),
+            me,
+            "chequebook is bound"
+        );
+        assert_ne!(
+            recover_cheque_issuer(&cb, &bn, alloy_primitives::U256::from(501u64), 100, &sig)
+                .expect("rec"),
+            me,
+            "cumulative payout is bound"
+        );
+    }
+
+    #[test]
+    fn a_push_challenge_recovers_to_the_account() {
+        let s = signer();
+        let c = PushChallenge {
+            nonce: alloy_primitives::B256::from([9u8; 32]),
+            origin: "relay-a.example".into(),
+            account: alloy_primitives::Address::from(*s.eth_address()),
+            batchId: alloy_primitives::B256::from([5u8; 32]),
+            expiry: alloy_primitives::U256::from(1_700_000_000u64),
+        };
+        let sig = s.sign_push_challenge(&c, 100).expect("sign");
+        assert_eq!(
+            recover_push_challenge(&c, 100, &sig).expect("recover"),
+            *s.eth_address()
+        );
+    }
+
+    /// The whole point of binding `origin`: a signature gathered at relay A
+    /// must not verify at relay B (§11.1).
+    #[test]
+    fn a_push_challenge_binds_the_origin() {
+        let s = signer();
+        let mut c = PushChallenge {
+            nonce: alloy_primitives::B256::from([9u8; 32]),
+            origin: "relay-a.example".into(),
+            account: alloy_primitives::Address::from(*s.eth_address()),
+            batchId: alloy_primitives::B256::from([5u8; 32]),
+            expiry: alloy_primitives::U256::from(1_700_000_000u64),
+        };
+        let sig = s.sign_push_challenge(&c, 100).expect("sign");
+        c.origin = "relay-b.example".into();
+        assert_ne!(
+            recover_push_challenge(&c, 100, &sig).expect("recovers something"),
+            *s.eth_address(),
+            "a challenge signed for relay A must not recover the account at relay B"
+        );
+    }
+
+    /// A cheque and a challenge signed over structurally similar data must
+    /// live in different domains, or one could be replayed as the other.
+    #[test]
+    fn cheque_and_challenge_domains_are_distinct() {
+        assert_ne!(
+            chequebook_domain(100).separator(),
+            pusher_domain(100).separator()
+        );
+    }
+
+    #[test]
+    fn non_canonical_signatures_are_rejected() {
+        let s = signer();
+        let (cb, bn) = ([0x11u8; 20], [0x22u8; 20]);
+        let amount = alloy_primitives::U256::from(1u64);
+        let good = s.sign_cheque(&cb, &bn, amount, 100).expect("sign");
+        check_canonical_signature(&good).expect("alloy always produces canonical");
+
+        let mut bad_v = good;
+        bad_v[64] = 1; // the 0/1 encoding alloy accepts and the contract does not
+        let e = check_canonical_signature(&bad_v).expect_err("v=1 must be rejected");
+        assert!(format!("{e}").contains("non-canonical v"), "got: {e}");
+
+        let mut high_s = good;
+        high_s[32] = 0xFF; // s > secp256k1n/2
+        let e = check_canonical_signature(&high_s).expect_err("high-s must be rejected");
+        assert!(format!("{e}").contains("high-s"), "got: {e}");
+
+        for len in [0usize, 64, 66] {
+            check_canonical_signature(&vec![1u8; len]).expect_err("bad length must be rejected");
+        }
+    }
+
+    /// Exactly the boundary OpenZeppelin enforces: `s <= n/2` passes,
+    /// `s = n/2 + 1` does not.
+    #[test]
+    fn the_high_s_boundary_matches_openzeppelin() {
+        let mut sig = [0u8; 65];
+        sig[64] = 27;
+        sig[32..64].copy_from_slice(&SECP256K1N_HALF);
+        check_canonical_signature(&sig).expect("s == n/2 is allowed");
+        sig[63] += 1;
+        check_canonical_signature(&sig).expect_err("s == n/2 + 1 is not");
+    }
 }

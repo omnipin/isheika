@@ -14,6 +14,12 @@
  *
  * Chunks are sharded across the lanes (rendezvous hashing) and pushed
  * concurrently; a chunk unacked by one lane fails over to the next.
+ *
+ * Payment is per lane and optional (docs/pusher-incentives.md). A lane
+ * advertising `enforcement: "hard"` in its `/v1/status` is dropped from
+ * rotation at startup by `setLaneStatus`, because this dApp only stamps —
+ * the chequebook lives in the native client. Such a lane is listed anyway so
+ * a native `--chequebook` run of the same fleet picks it up.
  */
 export const PUSHER_URLS: string[] = [
   'https://hoverfly-pusher.onrender.com',
@@ -21,7 +27,11 @@ export const PUSHER_URLS: string[] = [
   'https://hoverfly-pusher-3.onrender.com',
   // Hugging Face Space — a different provider/IP-range from Render (probed:
   // HF permits outbound TCP to bee nodes), for cross-provider lane diversity.
-  'https://ivam5567-hoverfly.hf.space'
+  'https://ivam5567-hoverfly.hf.space',
+  // A self-hosted VPS lane, and the first metered one: it runs `--meter` with
+  // hard enforcement, so it serves paying native clients and is skipped by
+  // the browser. Unlike the free tiers above it doesn't cold-start.
+  'https://pusher.browserbzz.link'
 ]
 /**
  * How long to wait for a relay's `/v1/status` before scheduling it on

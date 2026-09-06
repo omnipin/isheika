@@ -22,7 +22,11 @@ pub const STAMP_LEN: usize = 113;
 /// Max wire length: span(8) + max chunk data(4096).
 pub const MAX_WIRE_LEN: usize = 4104;
 /// Fixed frame header before the variable wire: addr + stamp + len(u16).
-const HEADER_LEN: usize = 32 + STAMP_LEN + 2;
+/// Public because it is the smallest a frame can be, which is what bounds
+/// how many frames a body of a given `Content-Length` can hold — the basis
+/// of the metered reservation (`docs/pusher-incentives.md` §7.2) and of
+/// Stage 0's per-frame byte accounting.
+pub const HEADER_LEN: usize = 32 + STAMP_LEN + 2;
 /// Upper bound on a single encoded frame.
 pub const MAX_FRAME_LEN: usize = HEADER_LEN + MAX_WIRE_LEN;
 
