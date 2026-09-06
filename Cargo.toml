@@ -1,6 +1,6 @@
 [package]
 name = "hoverfly"
-version = "0.1.11"
+version = "0.2.0"
 edition = "2024"
 description = "Minimal WASM-portable Swarm micro-client (native: TCP + WebSocket, WASM: WebSocket)"
 license = "MIT"
