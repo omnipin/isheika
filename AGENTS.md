@@ -9,14 +9,23 @@ retrieves chunks — without running a full Bee node or storing the network's
 chunks. It is *not* a thin HTTP wrapper around a gateway and not a full node.
 
 User-facing operations: `discover`, `fetch` (incl. mantaray manifest path
-resolution and mutable **feed**/ENS resolution), `upload`, plus on-chain
-helpers (`batch`, `bridge`) and a long-running `daemon`.
+resolution and mutable **feed**/ENS resolution), `upload` (raw / manifest /
+collection, Reed–Solomon `--redundancy`, optional `--pusher` relay lanes),
+a long-running `daemon` (plus `status`, `save-peers`), on-chain helpers
+(`batch create`, `chequebook deploy`/`fund`/`status`, `bridge`, relay
+`cashout`), offline hashing (`bmt`), `vanity-overlay`, and the `pusher`
+relay server itself.
 
-`README.md`, `index.ts`, `package.json`, `bun.lock`, and `node_modules/` at
-the repo root are vestigial `bun init` artifacts — ignore them (don't touch,
-don't rely on them). `README.npm.md` is the real published-package readme.
-The `apps/` dir holds two browser front-ends that embed the wasm build
-(see "Apps").
+`README.md` is the repo readme (brand mark: `logo.svg` above the title).
+`README.npm.md` is the published-package readme for `@omnipin/hoverfly`.
+There is no `package.json` / `index.ts` / `bun.lock` / `node_modules` at the
+root anymore (those old `bun init` leftovers are gone; a root `tsconfig.json`
+with bun types is still lying around — harmless, each app carries its own
+tsconfig). Other top-level entries: `install.sh`, `Cargo.toml` /
+`Cargo.lock`, `proto/` (+ `build.rs`), `vendor/futures-bounded`, `scripts/`,
+`examples/` (`regen-protos.rs`, `upload.yml`), `tests/`
+(`attack_vectors.rs`), `docs/` (`pusher-design.md`, `pusher-incentives.md`,
+`deck/`), `PERFORMANCE.md`, `apps/`, `.cargo/config.toml`, `Dockerfile`.
 
 ## Transport
 
@@ -34,6 +43,10 @@ Native (`cfg(not(target_arch = "wasm32"))`) and WASM differ:
   no v6) and either `/ws[s]` or plain `/tcp/` on native, `/ws[s]` only on
   wasm. The peers.json store reuses the same predicate via
   `peers.rs::is_dialable_str` in `PeerStore::upsert`.
+- Outbound dials are paced by `src/ratelimit.rs` (per-peer GCRA, mirrors bee's
+  ~10/s + burst-40 `/32` conn limiter): over-budget dials park on a delay
+  instead of failing; only past the reservation bound does it return
+  `DialTooSoon` so the chunk fails over to another peer.
 - DNS is **DoH-only** (`src/doh.rs`, `src/dnsaddr.rs`) — no system resolver.
   `/dnsaddr/mainnet.ethswarm.org` is resolved over HTTPS the same way in CLI,
   daemon and browser.
@@ -57,7 +70,11 @@ are in flight at once. Public API (`Behaviour`, `Control`, `IncomingStreams`,
 
 - Native: `cargo build` / `cargo build --release`. Release is ~2-5× faster on
   crypto paths but only ~10-15% end-to-end (network dominates).
-- Edition **2024**; crate version tracked in `Cargo.toml` (`0.1.x`).
+- Edition **2024**; crate version tracked in `Cargo.toml` (`0.1.x`, currently
+  `0.1.11`).
+- Default features are `cli`, `bridge`, `pusher`. `--no-default-features
+  --features cli` drops both the bridge and the relay server (native-only
+  code is compiled out entirely).
 - WASM: **nightly + `build-std` + `--no-default-features`** (the `cli`
   feature pulls non-wasm deps). `.cargo/config.toml` already sets the
   atomics/bulk-memory rustflags. After any lib change:
@@ -87,14 +104,21 @@ are in flight at once. Public API (`Behaviour`, `Control`, `IncomingStreams`,
     — and must avoid rayon contention on `parking_lot` locks, which can't park
     a thread on wasm.)
 
-  Nectar crates are pulled from **upstream 0.3.0** (crates.io). The old
+  Nectar crates are pulled from **upstream 0.4.0** (crates.io). The old
   `[patch.crates-io]` omnipin fork and its bespoke `wasm-threads` gate are
-  gone — upstream v0.3.0 has `MaybeSend`/`MaybeSync` (Send/Sync relaxed on
-  wasm) and `web_time` natively. API notes vs 0.2.0:
+  gone — upstream has `MaybeSend`/`MaybeSync` (Send/Sync relaxed on
+  wasm) and `web_time` natively. API notes vs the pre-0.3.0 shape:
   - `sync_split` → `split` (free function, same signature)
   - `SyncChunkGet`/`SyncChunkPut` → removed (use async `ChunkGet`/`ChunkPut`)
   - `ChunkStoreError::Other(String)` → `ChunkStoreError::Other(Box<dyn Error + Send + Sync>)`
   - `MemoryIssuer::from_batch` returns `Result<_, IssuerError>`
+
+  (Caveat: `src/manifest.rs` docs still cite nectar-mantaray's
+  `SyncChunkGet`-bounded public walk as one reason for the hand-rolled
+  decoder — that describes nectar-mantaray's API surface, not our store,
+  which only ever implements async `ChunkGet`. The `Cargo.toml` comments
+  name-dropping nectar 0.1.0 / alloy-primitives 1.5.x are likewise stale;
+  the tree is on nectar 0.4.0 / alloy-primitives 1.6.)
 
   There **is** one active `[patch.crates-io]`: `futures-bounded` →
   `vendor/futures-bounded`, whose `Delay::tokio` falls back to
@@ -115,14 +139,20 @@ are in flight at once. Public API (`Behaviour`, `Control`, `IncomingStreams`,
 
 ## Binaries
 
-- `hoverfly` (`src/bin/hoverfly.rs`) — the CLI. Subcommands: `discover`,
-  `fetch`, `upload`, `bmt` (compute a BMT/collection root offline), `daemon`,
-  `save-peers`, `vanity-overlay`, `batch create` (on-chain postage batch),
-  `bridge`.
+- `hoverfly` (`src/bin/hoverfly.rs`) — the CLI. Always available:
+  `discover`, `fetch`, `upload`, `bmt` (compute a BMT/collection root
+  offline), `vanity-overlay`. `#[cfg(unix)]` only: `daemon`, `save-peers`,
+  `status` (pool live-vs-target + peerlist candidates), `batch create`
+  (on-chain postage batch), `chequebook deploy`/`fund`/`status` (SimpleSwap
+  chequebook lifecycle). Feature-gated: `pusher` (HTTP chunk-push relay;
+  `#[cfg(feature = "pusher")]`), `cashout` (bank metered-relay cheques from
+  `ledger.json`; `#[cfg(all(unix, feature = "pusher"))]`), `bridge`
+  (`#[cfg(feature = "bridge")]`, default-on). The `fetch`/`upload --daemon`
+  client flags are `#[cfg(unix)]` too.
 - `sigcheck` (`src/bin/sigcheck.rs`) — signer/handshake reference comparison
   tool, not user-facing.
 
-Both require `--features cli` (default). The `cli` feature gates `clap`,
+`hoverfly` requires `--features cli` (default). The `cli` feature gates `clap`,
 `tracing-subscriber`, `tar`, and `indicatif`.
 
 The `bridge` feature (default-on) gates the `hoverfly bridge` subcommand and
@@ -130,6 +160,18 @@ The `bridge` feature (default-on) gates the `hoverfly bridge` subcommand and
 It adds no new dependencies (reuses the reqwest + alloy signing stack already
 pulled in for `batch.rs`) and is native-only
 (`#[cfg(all(not(target_arch = "wasm32"), feature = "bridge"))]`).
+
+The `pusher` feature (default-on) gates the `hoverfly pusher` relay server
+plus the relay-side ledger/metering (`src/pusher.rs`, `src/ledger.rs`,
+`src/metered.rs`, `src/inbound_limit.rs`). Compile it out with
+`--no-default-features --features cli`. It pulls `hyper`/`hyper-util`/
+`http-body-util` and is native-only
+(`#[cfg(all(feature = "pusher", not(target_arch = "wasm32")))]`). The
+*client* half of paid relaying (`src/challenge.rs`, `src/meter.rs`,
+`src/payer.rs`) is `#[cfg(not(target_arch = "wasm32"))]` but deliberately
+**not** `pusher`-gated: `client.rs` reaches for it on every relay push, so
+gating it would break `--no-default-features --features cli` builds (see the
+comment atop those modules in `src/lib.rs`).
 
 ## Apps (browser front-ends embedding the wasm)
 
@@ -153,10 +195,18 @@ pulled in for `batch.rs`) and is native-only
 
 ## Tests / verification
 
-There is no test suite. `dev-dependencies = tokio-test` exists but no
-`#[test]`s or integration tests do. Verify changes by:
+~260 unit tests live next to the code (`#[test]` almost everywhere;
+`#[tokio::test]` only in `src/daemon.rs` and `src/feed.rs`), plus
+`tests/attack_vectors.rs` (adversarial pure-logic tests for the
+`docs/pusher-incentives.md` threat model — challenge MACs, ledger
+monotonicity, cheque decoding, quote/credit/scheduler accounting; run with
+`cargo test --test attack_vectors`). Heaviest suites: `src/payer.rs`,
+`src/pushsched/tests.rs` (deterministic mock-lane + virtual-clock simulation,
+no network/clock/threads), `src/meter.rs`, `src/metered.rs`, `src/ledger.rs`,
+`src/erasure/encoder.rs`. `dev-dependencies = tokio-test` still exists but is
+near-unused (one `block_on` in `src/protocols/pushsync.rs`). Verify changes by:
 
-1. `cargo build` (native) + the wasm check above. Both must pass.
+1. `cargo test` (native) + `cargo build` + the wasm check above. All must pass.
 2. End-to-end against mainnet:
    `discover --healthcheck` → `upload` → cross-verify via
    `https://api.gateway.ethswarm.org/bzz/<root>/<path>` or `https://bzz.limo/bzz/<root>/`.
@@ -168,23 +218,26 @@ There is no test suite. `dev-dependencies = tokio-test` exists but no
 ## WASM constraints (will bite you)
 
 - `tokio_with_wasm::time::{Sleep, Timeout, Interval}` are **not `Send`**.
-  Upstream nectar v0.3.0 uses `MaybeSend`/`MaybeSync` on wasm, relaxing the
-  `+ Send` bound on ChunkGet. The old `send_wrapper` workaround for the
-  `ChunkGet` impl is therefore removed. However, `send_wrapper` is still
-  used by `src/wsws/mod.rs` to make the WebSocket `Connection` struct `Send`
-  (libp2p's transport trait requires it).
+  Upstream nectar uses `MaybeSend`/`MaybeSync` on wasm, relaxing the
+  `+ Send` bound on ChunkGet. Both `ChunkGet` impls in `client.rs`
+  (native + wasm) are now identical plain `async fn` bodies — the old
+  `SendWrapper` workaround on the retrieval path is gone. `send_wrapper` is
+  still used by `src/wsws/mod.rs` to make the WebSocket `Connection` struct
+  `Send` (libp2p's transport trait requires it).
 - Per-target `impl` blocks gated by
   `#[cfg(target_arch = "wasm32")]` / `#[cfg(not(target_arch = "wasm32"))]`.
-- `walk_manifest` in client.rs switched from `FuturesUnordered` (Send-bound)
-  to sequential iteration on wasm because the ChunkGet future is no longer
-  wrapped to be Send.
+- The manifest walk keeps one async body and gates only the trait-object
+  bound per target (`MaybeSendWalk` in client.rs: `+ Send` on native so the
+  daemon can `tokio::spawn` a list request, dropped on wasm where the store
+  is IndexedDB-backed and `!Send`). Fetch paths use `FuturesUnordered` on
+  both targets.
 - `tokio_with_wasm` is missing: `runtime::Handle`, `time::Instant`,
   `time::interval_at`, `Sleep::reset`. For sleep-resets, re-pin a fresh
   `Box::pin(tokio::time::sleep(d))`. On the upload/wasm path never call
   `std::time::{SystemTime,Instant}::now()` — use `web_time::Instant` or
   `js_sys::Date`.
 - `Cargo.toml` deliberately pulls three `getrandom` package versions
-  (0.2, 0.3, 0.4) on wasm — alloy-primitives 1.6.x pulls 0.4 transitively.
+  (0.2, 0.3, 0.4) on wasm — alloy-primitives 1.x pulls 0.4 transitively.
   Do not "clean up" these duplicates without checking the transitive graph.
 - `futures-timer` is pulled with the `wasm-bindgen` (gloo-timers) feature so
   libp2p-swarm/ping's `Delay` doesn't panic in-browser.
@@ -207,7 +260,10 @@ There is no test suite. `dev-dependencies = tokio-test` exists but no
   in-flight buffer capped at 128. Public `SessionPool` lets the daemon reuse a
   warm pool across requests; `*_with_pool` variants of `upload_bytes` /
   `upload_file_with_manifest` call `push_chunks_with_pool` directly.
-  Collections still go through the one-shot `upload_collection`.
+  Collections still go through the one-shot `upload_collection`. Only the
+  `DEFAULT_*` concurrency consts are `pub`; the tuning consts
+  (`CHUNK_PEER_PARALLELISM`, `PREEMPT_INTERVAL`, `MAX_CHUNK_RETRIES`,
+  `DEAD_SKIP_SECS`/`DEAD_STRIKES`, `SESSION_DIAL_PARALLELISM`) are private.
 - `src/feed.rs` — Swarm **feed retrieval** (read-only). Resolves the latest
   update of a sequence-indexed feed (single-owner chunks) via a concurrent
   exponential-probe + k-ary search, then extracts the content reference. Feed
@@ -221,7 +277,17 @@ There is no test suite. `dev-dependencies = tokio-test` exists but no
   anyone with socket access can read/write the daemon's filesystem and sign
   uploads with whatever key they send.
 - `src/inbound.rs` — `#[cfg(not(target_arch = "wasm32"))]` only. Optional
-  daemon listener for serving retrieval requests from the local upload cache.
+  daemon listener for serving retrieval requests from the local upload cache
+  (default `/ip4/0.0.0.0/tcp/1634/ws`; needs `--advertise .../p2p/<id>` for
+  kademlia insertion, else it stays local-only). Serves handshake / pricing /
+  retrieval responders so fresh roots resolve via `bzz.limo` pre-pushsync.
+  No pullsync responder by design (we store no chunks).
+- `src/inbound_limit.rs` — `#[cfg(all(feature = "pusher",
+  not(target_arch = "wasm32")))]`. Inbound token-buckets for the relay HTTP
+  surface (per-IP `/v1/challenge`, per-account `/v1/pay|push`). Refuses
+  immediately instead of parking (a parking limiter would be a memory
+  amplifier); fail-closed eviction. Cannot reuse `ratelimit.rs` for this
+  reason.
 - `src/protocols/` — bee wire protocols. Current on-wire ids:
   `handshake` `15.0.0` (+ `14.0.0` fallback), `hive` `2.0.0` (+ `1.1.0`),
   `pricing` `1.0.0`, `pseudosettle` `1.0.0`, `pushsync` `1.3.1`,
@@ -266,18 +332,70 @@ There is no test suite. `dev-dependencies = tokio-test` exists but no
   defines the deprioritization window. `upsert` filters underlays via
   `is_dialable_str` (same predicate as the transport), so non-`/ip4/` and
   non-dialable entries are silently dropped on ingestion.
-- `src/stamp.rs` — postage-stamp wire validator (113-byte shape + owner
-  recovery). Does NOT verify on-chain batch ownership (no RPC). Currently
-  unused for ingestion; ready for a future chunk-ingestion path.
-- `src/manifest.rs` — mantaray encode/decode helpers.
-- `src/erasure/` — **Reed–Solomon erasure coding, both directions.** Since
-  ~bee v2.8.1 gateway uploads are RS erasure coded by default, so a fresh
-  upload's data chunks can be unretrievable for a forwarding-dependent light
-  client while parity chunks let the file be reconstructed (ethersphere/bee
-  #5541). `reedsolomon.rs` is a byte-exact port of klauspost's default matrix +
-  GF(2^8) encode/reconstruct (golden-vector tested); `mod.rs` has the bee
-  span/level decode, per-level erasure tables, and
-  `ReferenceCount`/`ChunkAddresses` helpers.
+- `src/stamp.rs` — postage-stamp wire validator (113-byte
+  `[batch32|index8|ts8|sig65]` shape + EIP-191 owner recovery). Signature-only:
+  does NOT verify on-chain batch ownership (no-RPC rule) — safe only because
+  the stamp path is upload-only; there is no pullsync ingestion to forge
+  against.
+- `src/manifest.rs` — hand-rolled mantaray v0.1/v0.2 decoder + walker (the
+  *decode* side; the *encode* side already uses `nectar-mantaray`). Kept
+  because nectar's public walk is sync-bound and its `Node` fork/metadata
+  fields aren't public — see the module docs and upstream nectar#37.
+- `src/pusher.rs` — `#[cfg(all(feature = "pusher",
+  not(target_arch = "wasm32")))]`. HTTP chunk-push relay (`POST /v1/push`
+  takes pre-signed frames, streams NDJSON acks; `GET /v1/status`;
+  flag-gated `POST /v1/probe` + `/v1/tcpcheck` experiment endpoints). Open
+  mode admits a frame iff its stamp recovers to a live batch owner
+  (`remainingBalance > 0`, cached RPC); key material never crosses the wire
+  (the probe's env-key signing is the sole exception, off by default). See
+  `docs/pusher-design.md`.
+- `src/pushframe.rs` — ungated (native + wasm). The push-body codec both
+  sides share: `addr(32) | stamp(113) | wire_len(u16LE) | wire(≤4104)`.
+  `encode_*` asserts on bad stamp/wire instead of returning `Err` — callers
+  must come from `prepare_upload_*`.
+- `src/meter.rs` — `#[cfg(not(target_arch = "wasm32"))]`. Stage-0 shadow
+  metering: counts what billing *would* be (served via `/v1/meter`), no wire
+  change and no refusals; gates stage-1 rollout on volume. In-memory only —
+  restarts reset the window.
+- `src/metered.rs` — `#[cfg(all(feature = "pusher",
+  not(target_arch = "wasm32")))]`. Relay-side stages 1–2: soft meters and
+  serves, hard flips to 402 with shared over-cap arithmetic. No challenge on
+  file in soft mode means unmetered (rollout state); a present-but-invalid
+  challenge is refused in both modes.
+- `src/payer.rs` — `#[cfg(not(target_arch = "wasm32"))]`. Client half of
+  stage-1: verify + pin the relay quote → challenge + header → split POST
+  capped at `cap_plur` → cumulative cheque every `settle_every`. Bills from
+  bytes *sent*, never from relay reports (on dispute: don't pay). The account
+  key is the batch stamp key — no extra wallet prompt.
+- `src/ledger.rs` — `#[cfg(all(feature = "pusher",
+  not(target_arch = "wasm32")))]`. Relay billing ledger
+  (`owed + reserved + last_cumulative + chequebook→account` under one lock,
+  atomically persisted). `reserved` intentionally resets to zero at boot;
+  losing `last_cumulative` alone replays a full cumulative cheque — guard the
+  state dir accordingly.
+- `src/challenge.rs` — `#[cfg(not(target_arch = "wasm32"))]`. Stateless relay
+  admission capability: relay MAC (no nonce table) + client EIP-712 signature
+  binding `origin/account/batch/cap` (`TTL = 300 s`). Verify `origin` against
+  configured hostnames, never the `Host` header.
+- `src/ratelimit.rs` — ungated. Per-peer outbound dial GCRA pacer (see
+  "Transport"). Parks instead of refusing; `reserve_bounded` still returns
+  `DialTooSoon` past budget so the chunk fails over.
+- `src/cache.rs` — `ChunkCache = Arc<RwLock<HashMap<…>>>`, clone-cheap,
+  mirrors bee's uploadstore. In-memory and unbounded (~4 KiB/entry) — no
+  disk, no LRU.
+- `src/cid.rs` — ref32 → CIDv1 (`b` + base32-nopad over the
+  `0x01/0xfa/0x1b` prefix) for `bzz.limo` / ENS `contenthash`. CID path only.
+- `src/mime.rs` — `mime_guess` wrapper for collection-manifest
+  `Content-Type` (appends `charset=utf-8` to text JS/JSON/XML; `None` lets
+  the gateway fall back to `application/octet-stream`).
+- `src/erasure/` — **Reed–Solomon erasure coding, both directions**
+  (shipped in `v0.1.11`). Since ~bee v2.8.1 gateway uploads are RS erasure
+  coded by default, so a fresh upload's data chunks can be unretrievable
+  for a forwarding-dependent light client while parity chunks let the file
+  be reconstructed (ethersphere/bee #5541). `reedsolomon.rs` is a byte-exact
+  port of klauspost's default matrix + GF(2^8) encode/reconstruct
+  (golden-vector tested); `mod.rs` has the bee span/level decode, per-level
+  erasure tables, and `ReferenceCount`/`ChunkAddresses` helpers.
   - **Download** — `joiner.rs` is a bee-compatible tree-walking joiner that
     fetches each intermediate node's data children and RS-reconstructs any that
     time out from the node's parity siblings. `client::join_target` detects a
@@ -352,7 +470,8 @@ There is no test suite. `dev-dependencies = tokio-test` exists but no
 - `src/wasm.rs` — `wasm-bindgen` façade (`HoverflyClient`): `start`/`stop`,
   peer load/merge/export, `prewarmSessions`, `enableChunkStore`,
   `discover`/`fetch`/`fetchManifestPath`/`listManifest`,
-  `upload`/`uploadFile`/`uploadCollection`, upload progress/diagnostics, and
+  `upload`/`uploadFile`/`uploadCollection` (+ streaming `begin_upload` /
+  `begin_collection` for the pusher path), upload progress/diagnostics, and
   feed-hint import/export. WASM-only.
 - `src/idb_chunk_store.rs` — persistent IndexedDB-backed L2 chunk cache
   (browser only). Immutable content-addressed chunks survive reloads on top
@@ -366,28 +485,35 @@ There is no test suite. `dev-dependencies = tokio-test` exists but no
 - `src/wsws/` — vendored libp2p-websocket-websys, patched so
   `WebSocket.send()` gets a non-shared buffer (the wasm memory is a
   `SharedArrayBuffer` in the atomics build and Chrome rejects shared views).
-- `src/cache.rs`, `src/cid.rs`, `src/doh.rs`, `src/dnsaddr.rs`, `src/mime.rs`
-  — support modules.
-- `src/lib.rs` — public re-exports; canonical view of what's stable API.
+- `src/doh.rs`, `src/dnsaddr.rs` — DoH client + `/dnsaddr/` resolution and
+  the dialability predicate shared with the peer store.
+- `src/lib.rs` — public re-exports; canonical view of what's stable API
+  (gates: `batch`/`cheques`/`inbound`/`challenge`/`meter`/`payer` are
+  `not(wasm)`; `daemon` is `unix`; `bridge` is `not(wasm)+bridge`;
+  `inbound_limit`/`ledger`/`metered`/`pusher` are `pusher+not(wasm)`;
+  `wasm`/`idb_chunk_store`/`wsws` are wasm-only). Also hosts
+  `MAINNET_BOOTNODE`, `DEFAULT_DOH_URL`, `VERSION`.
 
 ## Repo conventions
 
-- Multiple git remotes: `github` → GitHub (`omnipin/hoverfly.git`),
-  `rad` → Radicle (push), `iris` → Radicle (HTTPS mirror via
-  `iris.radicle.xyz`), `vps` → SSH push to the VPS that runs the
-  long-lived daemon. Push targets are explicit; there's no shared
-  default — pick the remote you mean.
-- `peers.json` is gitignored (runtime artifact). The CLI writes reachability
-  observations back into it on every operation; respect existing fields on
-  read (see `apply_log` / `record_dial_{success,failure}`).
+- Upstream is `omnipin/hoverfly` on GitHub. Push targets are explicit —
+  check `git remote -v` in your clone and pick the remote you mean (a clone
+  may carry extra Radicle / VPS-daemon remotes); there is no shared default.
+- Runtime artifacts are gitignored — never commit them: `peers.json`
+  (reachability observations, written back on every operation; respect
+  existing fields on read), `overlay-nonce` (default `--nonce-file`), and
+  `cheques.json` (**money state**: per-peer cumulative payouts — committing
+  it publishes who was paid what, and restoring a stale copy re-issues
+  cheques the counterparty already banked). Stray `blob*.bin` / `hello.tar`
+  at root are local upload-test leftovers.
 - **`peers.seed.json`** (committed, ~800 IPs) and **`peers.ws.json`**
   (committed, WS-dialable subset for the browser builds) are IP-diverse
   cold-start seeds harvested from a long-running daemon. CI copies a seed to
   `peers.json` before starting the daemon so a fresh runner doesn't discover
   from scratch. Regenerate via `hoverfly save-peers --socket <sock>` against a
   daemon that's been running a few hours.
-- Hard constants worth knowing before tuning (file:line — verify current
-  values, they drift):
+- Hard constants worth knowing before tuning (names are stable, lines drift —
+  grep before trusting a line number):
   - `transport.rs  MAX_PUSHES_PER_SESSION = 10_000` — defence-in-depth
     safety net; normal rotation is driven by ghost balance, not this.
   - `transport.rs  GHOST_BALANCE_LIMIT_PLUR = 12_000_000` — client-side
@@ -401,7 +527,8 @@ There is no test suite. `dev-dependencies = tokio-test` exists but no
   - `stream_pool/handler.rs  DEFAULT_MAX_CONCURRENT_OUTBOUND_UPGRADES = 64`
     — per-connection concurrent substream-upgrade cap (`--substream-upgrade-cap`).
   - `client.rs  DEFAULT_FETCH_CONCURRENCY = 5`,
-    `DEFAULT_DISCOVER_CONCURRENCY = 16`, `DEFAULT_UPLOAD_CONCURRENCY = 8`.
+    `DEFAULT_DISCOVER_CONCURRENCY = 16`, `DEFAULT_UPLOAD_CONCURRENCY = 8`
+    (the only `pub` tuning consts — the rest below are private).
   - `client.rs  CHUNK_PEER_PARALLELISM = 3` — each chunk races up to 3
     proximity-ordered peers (≈2-3× throughput for ≈3× bandwidth).
     `PREEMPT_INTERVAL = 1s` extends/tops-up that race window when the initial
@@ -416,6 +543,13 @@ There is no test suite. `dev-dependencies = tokio-test` exists but no
     single slow op shouldn't retire a whole session with many in-flight pushes.
   - `client.rs  SESSION_DIAL_PARALLELISM = 128` — in-flight window while
     filling the session pool (absorbs the high mainnet dial-rejection rate).
+- Global CLI flags worth knowing: `--nonce-file` (default `overlay-nonce`),
+  `--chequebook` + `--chequebook-chain-id`, `--cheques-file` (default
+  `cheques.json`), `--lane-pin` (repeatable relay pin, else TOFU),
+  `--buffer-multiplier`, `--substream-upgrade-cap`. Upload: `--redundancy`
+  (default `medium`), `--pusher` (repeatable relay URL, bypasses peerlist).
+  Daemon: `--pool-size` (default 256), `--discover-rounds` (default 1),
+  `--listen` / `--identity` / `--advertise` (inbound experiment).
 - Network IDs: `1` = mainnet (default), `10` = testnet/sepolia. Bootnode:
   `/dnsaddr/mainnet.ethswarm.org`. **EVM chain id** is separate from
   network id (it's the `chainID` in the cheque's EIP-712 domain): 100
@@ -445,15 +579,25 @@ There is no test suite. `dev-dependencies = tokio-test` exists but no
   because bee 2.8's reacher uses `/ipfs/ping/1.0.0` to verify reachability;
   failed pings mark us private and the kademlia prune loop kicks us. See
   PERFORMANCE.md "Bee 2.8.0 protocol migration".
-- **SWAP / chequebook** is implemented but scoped to *issuance only*: no
-  contract deploy, no cashout, no on-chain RPC. Caller supplies an
-  already-deployed chequebook via `--chequebook` whose `issuer()` matches
-  `--key`'s eth address. Sessions advertise the beneficiary in a one-shot
-  `/swarm/swap/1.0.0/swap` handshake at connect; `try_settle_once` then emits
-  a cheque for the PLUR remainder after pseudosettle. Exchange-rate fallback
-  is abort→pseudosettle-only (no hardcoded rate; trust bee's per-stream
-  `exchange`+`deduction` headers). Correct but no measured throughput benefit
-  at one-shot upload workloads. See PERFORMANCE.md "SWAP / chequebook".
+- **SWAP / chequebook** has grown past issuance-only: peer sessions still
+  advertise the beneficiary in a one-shot `/swarm/swap/1.0.0/swap` handshake
+  and `try_settle_once` emits a cheque for the PLUR remainder after
+  pseudosettle (exchange-rate fallback is abort→pseudosettle-only — no
+  hardcoded rate; trust bee's per-stream `exchange`+`deduction` headers),
+  but the CLI now also manages the chequebook lifecycle itself
+  (`chequebook deploy`/`fund`/`status` on Gnosis via alloy) and banks
+  metered-relay cheques (`cashout` reads the relay `ledger.json` — an
+  off-box operation). What still doesn't exist: on-chain verification in the
+  stamp path (`src/stamp.rs` is signature-shape + owner recovery only, no
+  RPC) and cashout of peer-issued cheques. Correct but no measured throughput
+  benefit at one-shot upload workloads. See PERFORMANCE.md "SWAP / chequebook".
+- **Metered relay (pusher,** `docs/pusher-design.md`,
+  `docs/pusher-incentives.md`). Stages: 0 = shadow metering (`/v1/meter`,
+  no refusals), 1–2 = challenge + quote + cumulative-cheque settlement
+  (`challenge.rs` / `payer.rs` client-side, `metered.rs` / `ledger.rs`
+  relay-side, `cashout` to bank). Threat model and attack-vector tests live
+  in `tests/attack_vectors.rs`. Billing is always computed from bytes the
+  *client* sent, never from relay reports.
 - **Diagnostics** (May 2026): `diag::CONN_CLOSED_IO_DETAIL` buckets
   `ConnectionClosed.cause` (empirically ~100% ECONNRESET from bee's kademlia
   bin-prune of non-public peers — mitigate with `daemon + --listen +
@@ -474,10 +618,12 @@ There is no test suite. `dev-dependencies = tokio-test` exists but no
 
 ## When changing this code
 
-- After any `transport.rs`, `client.rs`, or trait-bound change, run both
-  the native build and the wasm check. `Send`-bound regressions on wasm
-  are by far the most common breakage (nectar v0.3.0 `MaybeSend` relaxes
-  this for ChunkGet, but other paths like `tokio::spawn` still require Send).
+- After any `transport.rs`, `client.rs`, or trait-bound change, run `cargo
+  test` plus both the native build and the wasm check. `Send`-bound
+  regressions on wasm are by far the most common breakage (nectar 0.4.0
+  `MaybeSend` relaxes this for ChunkGet and the manifest walk gates its
+  bound via `MaybeSendWalk`, but other paths like `tokio::spawn` still
+  require Send).
 - Network behaviour is empirical. If you change defaults or the constants
   above, measure against mainnet with a freshly randomised file (bee
   dedupes by chunk address: identical bytes re-upload in O(stamp) and tell

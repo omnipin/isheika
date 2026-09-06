@@ -1,3 +1,5 @@
+<img src="./logo.svg" width="75" height="75" alt="hoverfly logo" />
+
 # hoverfly
 
 Experimental [Swarm][swarm] light client. Upload and download files to decentralized storage natively and in a browser.

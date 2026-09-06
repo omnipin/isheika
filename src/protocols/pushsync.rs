@@ -1,4 +1,4 @@
-//! Bee pushsync protocol — `/swarm/pushsync/1.3.0/pushsync`.
+//! Bee pushsync protocol — `/swarm/pushsync/1.3.1/pushsync`.
 //!
 //! Client opens stream → sends `Headers { headers: [] }` → sends
 //! `Delivery { address, data, stamp }` → reads `Headers` → reads `Receipt`.
